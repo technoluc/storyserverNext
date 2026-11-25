@@ -38,8 +38,9 @@ from .hls_root import direct_media_playlist  # NEXTORY_HLS_DIRECT_MEDIA_V1
 from .hls_book import BookPlanCache, book_ref, PLAY_TOTAL_BUDGET_SECONDS  # NEXTORY_SINGLE_PRESENTATION_V2
 from .progress import listening_history, progress_store
 from . import fixed_m4b  # NEXTORY_FIXED_M4B_V1
-from .discovery import (CATEGORIES, CatalogPreview, CatalogIndex, NextoryError as DiscoveryError,
-                        REFRESH_SECONDS, catalog_index, item_id_for)
+from .discovery import (CATEGORIES, COLLECTION_GROWTH, COLLECTION_INITIAL_TARGET, CatalogPreview,
+                        CatalogIndex, NextoryError as DiscoveryError, REFRESH_SECONDS,
+                        catalog_index, is_dutch, item_id_for, search_dutch_catalog)
 
 COMPAT_VERSION = '2.25.0'  # Native iOS uses public/session direct-play route since 2.22.
 USERNAME = os.getenv('TEST_USERNAME', 'test')
@@ -376,18 +377,34 @@ def summary_item(preview: CatalogPreview) -> dict:
             'mediaType': 'book', 'media': media, 'numFiles': 1, 'size': 0}
 
 
-def _library_list(shelf: str, page: int, limit: int):
+def _prepare_category(shelf: str, page: int, limit: int):
     if shelf.startswith('category:'):
         try:
             catalog_index.ensure_category(shelf.split(':', 1)[1], page, limit)
         except NextoryError as exc:
             logging.warning('Category discovery unavailable (%s): %s', shelf, exc)
             # Keep last good indexed pages; report source error in status.
+
+
+def _library_list(shelf: str, page: int, limit: int):
+    _prepare_category(shelf, page, limit)
     return catalog_index.select(shelf, page, limit)
 
 
 async def dynamic_listing(shelf: str, page: int = 0, limit: int = 20):
     return await run_in_threadpool(_library_list, shelf, page, limit)
+
+
+def _collection_listing(shelf: str, page: int, limit: int | None):
+    if limit is not None:
+        return _library_list(shelf, page, limit)
+    if shelf.startswith('category:'):
+        _, count = catalog_index.select(shelf, 0, 1)
+        target = max(COLLECTION_INITIAL_TARGET, count + COLLECTION_GROWTH)
+        _prepare_category(shelf, 0, target)
+    # Audiobookshelf collection clients generally expect a flat list of all
+    # currently indexed books and do not send page/limit.
+    return catalog_index.select(shelf, 0, -1)
 
 
 async def _discovery_poller():
@@ -781,14 +798,18 @@ async def all_collections(_: bool = Depends(authenticated)):
 
 
 @app.get('/api/collections/{collection_id}')
-async def collection_detail(collection_id: str, _: bool = Depends(authenticated)):
+async def collection_detail(collection_id: str, page: int = 0, limit: int | None = None,
+                            _: bool = Depends(authenticated)):
     shelf = COLLECTION_BY_ID.get(collection_id)
     if shelf is None:
         raise HTTPException(status_code=404, detail='Collection not found')
-    # The collection list is instant. Opening a specific category hydrates
-    # only that category (and only its first metadata page).
-    previews, count = await dynamic_listing(shelf, 0, 40)
-    return collection_json(shelf, [summary_item(p) for p in previews], total=count)
+    if not 0 <= page <= 10000 or (limit is not None and not 1 <= limit <= 200):
+        raise HTTPException(status_code=400, detail='Invalid collection pagination')
+    previews, count = await run_in_threadpool(_collection_listing, shelf, page, limit)
+    result = collection_json(shelf, [summary_item(p) for p in previews], total=count)
+    if limit is not None:
+        result.update(page=page, limit=limit)
+    return result
 
 
 @app.get('/api/libraries/{library_id}/authors')
@@ -828,7 +849,7 @@ async def search(library_id: str, q: str = '', _: bool = Depends(authenticated))
     if len(query) > 100:
         raise HTTPException(status_code=400, detail='Search is too long')
     try:
-        previews = await run_in_threadpool(nextory.search_catalog, query, 0, 30)
+        previews = await run_in_threadpool(search_dutch_catalog, query)
         if previews:
             await run_in_threadpool(catalog_index.upsert, previews)
         entries = [CatalogPreview.from_dict(p) for p in previews]
@@ -873,7 +894,7 @@ async def item(item_id: str, expanded: int = 0, _: bool = Depends(authenticated)
     if preview is None:
         try:
             mapped = await run_in_threadpool(nextory.get_product_preview, book_id)
-            if not mapped:
+            if not mapped or not is_dutch(mapped.get('language')):
                 raise NextoryError('Nextory audiobook metadata unavailable')
             await run_in_threadpool(catalog_index.upsert, [mapped])
             preview = CatalogPreview.from_dict(mapped)

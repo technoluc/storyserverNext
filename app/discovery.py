@@ -54,6 +54,17 @@ CATEGORIES = (
 )
 CATEGORY_PATHS = {code: path for code, _, path in CATEGORIES}
 BOOK_HREF = re.compile(r'^/nl/book/[a-zA-Z0-9%\-]+-(\d{5,12})/?$')
+COLLECTION_INITIAL_TARGET = 120
+COLLECTION_GROWTH = 36
+SOURCE_PAGES_PER_REQUEST = 6
+
+
+def is_dutch(language: str | None) -> bool:
+    if not isinstance(language, str):
+        return False
+    language = language.strip().casefold().replace('_', '-')
+    return (language in {'dutch', 'nederlands', 'flemish', 'vlaams'} or
+            language.split('-', 1)[0] in {'nl', 'nld', 'dut'})
 
 
 def item_id_for(book_id: int) -> str:
@@ -144,6 +155,7 @@ class CatalogIndex:
     def __init__(self, path: Path = DB_PATH):
         self.path = path
         self._lock = threading.RLock()
+        self._category_locks = {key: threading.Lock() for key in CATEGORY_PATHS}
         self._web = requests.Session()
         self._web.headers.update({'User-Agent': 'NextoryABS-Discovery/0.5 (personal metadata index)',
                                   'Accept': 'text/html'})
@@ -152,6 +164,7 @@ class CatalogIndex:
     def _connect(self):
         con = sqlite3.connect(str(self.path), timeout=10)
         con.row_factory = sqlite3.Row
+        con.create_function('is_dutch', 1, is_dutch, deterministic=True)
         con.execute('PRAGMA busy_timeout=10000')
         return con
 
@@ -161,6 +174,8 @@ class CatalogIndex:
             con.execute('''CREATE TABLE IF NOT EXISTS books (
                 id INTEGER PRIMARY KEY, item_id TEXT NOT NULL UNIQUE, metadata TEXT NOT NULL,
                 first_seen REAL NOT NULL, last_seen REAL NOT NULL)''')
+            con.execute('''CREATE VIEW IF NOT EXISTS dutch_books AS
+                SELECT * FROM books WHERE is_dutch(json_extract(metadata, '$.language'))''')
             con.execute('''CREATE TABLE IF NOT EXISTS shelves (
                 shelf TEXT NOT NULL, page INTEGER NOT NULL,
                 position INTEGER NOT NULL, book_id INTEGER NOT NULL,
@@ -179,7 +194,8 @@ class CatalogIndex:
         for raw in products:
             try:
                 preview = CatalogPreview.from_dict(raw)
-                if not 10000 <= preview.book_id <= 999999999999 or not preview.title:
+                if (not 10000 <= preview.book_id <= 999999999999 or not preview.title
+                        or not is_dutch(preview.language)):
                     continue
                 unique[preview.book_id] = preview
             except (ValueError, TypeError, KeyError):
@@ -213,32 +229,35 @@ class CatalogIndex:
                                VALUES(?,?,?)''', (shelf, page, now))
         return new
 
-    def lookup(self, book_id: int) -> CatalogPreview | None:
+    def lookup(self, book_id: int, *, dutch_only: bool = True) -> CatalogPreview | None:
+        table = 'dutch_books' if dutch_only else 'books'
         with self._lock, self._connect() as con:
-            row = con.execute('SELECT metadata FROM books WHERE id=?', (book_id,)).fetchone()
+            row = con.execute(f'SELECT metadata FROM {table} WHERE id=?', (book_id,)).fetchone()
         return CatalogPreview.from_dict(json.loads(row['metadata'])) if row else None
 
     def resolve_item(self, item_id: str) -> int | None:
         with self._lock, self._connect() as con:
-            row = con.execute("SELECT id FROM books WHERE item_id=?", (item_id,)).fetchone()
+            row = con.execute("SELECT id FROM dutch_books WHERE item_id=?", (item_id,)).fetchone()
         return int(row[0]) if row else None
 
     def select(self, shelf: str = 'all', page: int = 0, limit: int = 20):
         with self._lock, self._connect() as con:
             if shelf == 'all':
-                query = 'SELECT metadata FROM books ORDER BY first_seen DESC,id DESC'
-                count = con.execute('SELECT COUNT(*) FROM books').fetchone()[0]
+                query = 'SELECT metadata FROM dutch_books ORDER BY first_seen DESC,id DESC'
+                count = con.execute('SELECT COUNT(*) FROM dutch_books').fetchone()[0]
                 rows = con.execute(query + ' LIMIT ? OFFSET ?', (limit, page*limit)).fetchall()
             elif shelf == 'new':
-                count = con.execute("SELECT COUNT(DISTINCT book_id) FROM shelves WHERE shelf='recent'").fetchone()[0]
-                rows = con.execute('''SELECT b.metadata FROM books b INNER JOIN
+                count = con.execute("""SELECT COUNT(DISTINCT s.book_id) FROM shelves s
+                                    JOIN dutch_books b ON b.id=s.book_id WHERE s.shelf='recent'""").fetchone()[0]
+                rows = con.execute('''SELECT b.metadata FROM dutch_books b INNER JOIN
                                       (SELECT book_id, MAX(page) AS p FROM shelves
                                       WHERE shelf='recent' GROUP BY book_id) x ON x.book_id=b.id
                                       ORDER BY b.first_seen DESC,b.id DESC LIMIT ? OFFSET ?''',
                                    (limit, page*limit)).fetchall()
             else:
-                count = con.execute('SELECT COUNT(DISTINCT book_id) FROM shelves WHERE shelf=?', (shelf,)).fetchone()[0]
-                rows = con.execute('''SELECT b.metadata FROM books b INNER JOIN (
+                count = con.execute('''SELECT COUNT(DISTINCT s.book_id) FROM shelves s
+                                    JOIN dutch_books b ON b.id=s.book_id WHERE s.shelf=?''', (shelf,)).fetchone()[0]
+                rows = con.execute('''SELECT b.metadata FROM dutch_books b INNER JOIN (
                                       SELECT book_id, MIN(page*1000+position) AS rank
                                       FROM shelves WHERE shelf=? GROUP BY book_id
                                       ) x ON b.id=x.book_id ORDER BY x.rank
@@ -251,8 +270,8 @@ class CatalogIndex:
             raise ValueError('Invalid catalog slice')
         with self._lock, self._connect() as con:
             where = ('WHERE id NOT IN (' + ','.join('?' for _ in exclude_ids) + ')') if exclude_ids else ''
-            count = con.execute('SELECT COUNT(*) FROM books ' + where, exclude_ids).fetchone()[0]
-            rows = con.execute('SELECT metadata FROM books ' + where +
+            count = con.execute('SELECT COUNT(*) FROM dutch_books ' + where, exclude_ids).fetchone()[0]
+            rows = con.execute('SELECT metadata FROM dutch_books ' + where +
                                ' ORDER BY first_seen DESC,id DESC LIMIT ? OFFSET ?',
                                (*exclude_ids, limit, offset)).fetchall()
         return [CatalogPreview.from_dict(json.loads(r['metadata'])) for r in rows], count
@@ -262,8 +281,7 @@ class CatalogIndex:
             return False
         with self._lock, self._connect() as con:
             exhausted = con.execute('SELECT 1 FROM stats WHERE key=?', ('end:' + shelf,)).fetchone()
-            scanned = con.execute('SELECT COUNT(*) FROM scans WHERE shelf=?', (shelf,)).fetchone()[0]
-        return scanned > 0 and not bool(exhausted)
+        return not bool(exhausted)
 
     def last_scan(self, shelf: str, page: int = 0) -> float:
         with self._lock, self._connect() as con:
@@ -272,8 +290,9 @@ class CatalogIndex:
 
     def statistics(self) -> dict:
         with self._lock, self._connect() as con:
-            count = con.execute('SELECT COUNT(*) FROM books').fetchone()[0]
-            recent = con.execute("SELECT COUNT(DISTINCT book_id) FROM shelves WHERE shelf='recent'").fetchone()[0]
+            count = con.execute('SELECT COUNT(*) FROM dutch_books').fetchone()[0]
+            recent = con.execute("""SELECT COUNT(DISTINCT s.book_id) FROM shelves s
+                                 JOIN dutch_books b ON b.id=s.book_id WHERE s.shelf='recent'""").fetchone()[0]
             scans = con.execute('SELECT shelf,page,scanned_at FROM scans ORDER BY scanned_at DESC LIMIT 8').fetchall()
             row = con.execute("SELECT value FROM stats WHERE key='error'").fetchone()
         return {'indexedAudiobooks': count, 'recentlyDiscovered': recent,
@@ -290,30 +309,31 @@ class CatalogIndex:
         parsed = urlparse(url)
         if parsed.scheme != 'https' or parsed.netloc != 'nextory.com' or not parsed.path.startswith('/nl'):
             raise NextoryError('Invalid public Nextory discovery URL')
-        response = self._web.get(url, timeout=WEB_TIMEOUT, stream=True, allow_redirects=False)
         try:
-            if response.status_code != 200:
-                raise NextoryError(f'Public Nextory catalogue HTTP {response.status_code}')
-            body = response.raw.read(MAX_WEB_BYTES + 1, decode_content=True)
-            if len(body) > MAX_WEB_BYTES:
-                raise NextoryError('Public Nextory catalogue page too large')
-            return body.decode('utf-8-sig', errors='replace')
-        finally:
-            response.close()
+            with self._web.get(url, timeout=WEB_TIMEOUT, stream=True, allow_redirects=False) as response:
+                if response.status_code != 200:
+                    raise NextoryError(f'Public Nextory catalogue HTTP {response.status_code}')
+                body = response.raw.read(MAX_WEB_BYTES + 1, decode_content=True)
+                if len(body) > MAX_WEB_BYTES:
+                    raise NextoryError('Public Nextory catalogue page too large')
+                return body.decode('utf-8-sig', errors='replace')
+        except requests.RequestException as exc:
+            raise NextoryError('Network error fetching public Nextory catalogue') from exc
 
     def _hydrate(self, ids: list[int], max_new: int = 40) -> list[dict]:
         previews = []
         for n in ids:
-            cached = self.lookup(n)
+            cached = self.lookup(n, dutch_only=False)
             if cached:
-                previews.append(cached.as_dict())
+                if is_dutch(cached.language):
+                    previews.append(cached.as_dict())
                 continue
             if max_new <= 0:
                 continue
             max_new -= 1
             try:
                 preview = nextory.get_product_preview(n)
-                if preview:
+                if preview and is_dutch(preview.get('language')):
                     previews.append(preview)
             except NextoryError:
                 continue  # Public page might include ebook-only, unreleased or region-restricted titles.
@@ -337,7 +357,7 @@ class CatalogIndex:
         # Public links can be missing or point only to unavailable titles.
         if not products:
             try:
-                products = nextory.search_catalog('', page=0, per=30)
+                products = search_dutch_catalog('', limit=30)
                 source = 'nextory-search'
             except NextoryError as exc:
                 failures.append(type(exc).__name__)
@@ -353,19 +373,17 @@ class CatalogIndex:
     def ensure_category(self, key: str, requested_page: int, limit: int = 20):
         if key not in CATEGORY_PATHS:
             raise NextoryError('Unknown Nextory catalogue category')
-        # Requests are paginated by Audiobookshelf. The public website uses
-        # 18/36 items per page; fetch one or two new source pages incrementally.
+        with self._category_locks[key]:
+            self._scan_category(key, (requested_page+1)*limit)
+
+    def _scan_category(self, key: str, target: int):
         shelf = 'category:' + key
-        existing = self.select(shelf, 0, (requested_page+1)*limit)[1]
-        target = (requested_page+1)*limit
-        if existing >= target:
+        if not self.category_has_more(shelf) or self.select(shelf, 0, 1)[1] >= target:
             return
-        scanned = 0
-        source_page = 1
-        while source_page <= 10000 and scanned < 3:
-            if self.last_scan(shelf, source_page):
-                source_page += 1
-                continue
+        with self._lock, self._connect() as db:
+            first = db.execute('SELECT COALESCE(MAX(page), 0) + 1 FROM scans WHERE shelf=?',
+                               (shelf,)).fetchone()[0]
+        for source_page in range(first, min(first + SOURCE_PAGES_PER_REQUEST, 10001)):
             uri = 'https://nextory.com' + CATEGORY_PATHS[key]
             if source_page > 1:
                 uri += '?page=' + str(source_page)
@@ -382,13 +400,29 @@ class CatalogIndex:
                     con.execute('INSERT OR REPLACE INTO stats(key,value) VALUES(?,?)',
                                 ('end:' + shelf, str(source_page)))
                 return
-            products = self._hydrate(ids, max_new=40)
+            products = self._hydrate(ids, max_new=100)
             self.upsert(products, shelf, source_page, replace=True)
-            scanned += 1
-            source_page += 1
-            existing = self.select(shelf, 0, target)[1]
-            if existing >= target:
+            if self.select(shelf, 0, 1)[1] >= target:
                 break
+
+
+def search_dutch_catalog(query: str, limit: int = 30) -> list[dict]:
+    results = {}
+    for page in range(3):
+        try:
+            previews = nextory.search_catalog(query, page=page, per=50)
+        except NextoryError:
+            if not results:
+                raise
+            break
+        if not previews:
+            break
+        for preview in previews:
+            if is_dutch(preview.get('language')):
+                results.setdefault(preview['book_id'], preview)
+                if len(results) == limit:
+                    return list(results.values())
+    return list(results.values())
 
 
 catalog_index = CatalogIndex()

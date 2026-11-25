@@ -22,7 +22,7 @@ Met `docker compose ps` zie je of de server gezond is. Met `docker compose logs 
 
 ## Catalogus
 
-De server haalt bij het starten automatisch luisterboekmetadata op bij Nextory en bewaart die in het Docker-volume. De bibliotheek kan bij een eerste start kort leeg zijn. Zoeken gebruikt Nextory live, en als je een genrecollectie opent kan de server meer titels aan de lokale index toevoegen. De bibliotheek groeit mee met die zoek- en ontdekacties. Je hoeft geen boek-ID’s in te vullen.
+De server haalt bij het starten automatisch metadata van Nederlandse luisterboeken op bij Nextory en bewaart die in het Docker-volume. De bibliotheek kan bij een eerste start kort leeg zijn. Zoeken gebruikt Nextory live. Wanneer je een genrecollectie opent, probeert de server die met volgende Nextory-pagina's aan te vullen. Als je de collectie opnieuw opent, kan ze verder groeien. Boeken met een andere of onbekende taal blijven buiten de catalogus. Je hoeft geen boek-ID’s in te vullen.
 
 ## Afspelen in AudioBooth
 
