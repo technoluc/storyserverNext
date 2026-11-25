@@ -22,7 +22,21 @@ Met `docker compose ps` zie je of de server gezond is. Met `docker compose logs 
 
 ## Catalogus
 
-De server vult genrecollecties op de achtergrond, één Nextory-pagina per genre per ronde. Hij wacht 15 seconden na een opgehaalde pagina voordat hij doorgaat. De collectie toont wat er al beschikbaar is. Na een herstart gaat de server verder vanaf de opgeslagen pagina. Zoeken gebruikt Nextory live. Boeken met een andere of onbekende taal blijven buiten de catalogus. In de containerlogs toont `POC_CATALOG` de verwerkte pagina en het aantal Nederlandse luisterboeken per genre.
+De bestaande SQLite-catalogus blijft behouden en wordt gebruikt voor snel bladeren en als fallback. Zoeken gebruikt standaard de live Nextory-webdiscovery, zonder accounttokens. Nieuwe zoekresultaten worden opgeslagen. Boekdetails behouden hun bestaande, begrensde prewarming (uitsluitend bij een uitgebreid detailverzoek, nooit tijdens een catalogusscan). Prewarming bereidt de stream voor en kan dus wel accountauthenticatie vereisen.
+
+| Optie in .env | Standaard | Betekenis |
+|---|---|---|
+| `CATALOG_AUTOSYNC` | `0` | Automatische catalogusopbouw voorlopig uit; opt-in na verificatie van de openbare metadata-API. |
+| `CATALOG_LIVE_SEARCH` | `1` | Live openbaar zoeken met lokale fallback. |
+| `NEXTORY_DETAIL_PREWARM` | `1` | Bestaande prewarming bij uitgebreid boekdetail. |
+
+Covers gebruiken opgeslagen openbare URLs, zonder reader-authenticatie. Productpreviews en zoeken gebruiken een afzonderlijke openbare HTTP-sessie. Bij 401, 403 of 429 op een openbare discovery-route wacht die route minstens een uur; er is geen automatische terugval naar een accountlogin. De openbare zoekroute was al aanwezig in de vorige implementatie; anonieme productpreviews moeten nog live worden geverifieerd.
+
+Een nieuwe installatie met lege catalogus kan titels via live zoeken toevoegen. De optionele handmatige recente-refresh (`POST /api/poc/discovery-refresh`) en de optionele catalogussynchronisatie gebruiken openbare metadata. De scan pauzeert categorieën bij herhaalde bronpagina's, drie pagina's zonder groei of maximaal 100 bronpagina's. Bij fouten wacht een categorie minstens een uur; niet-geschikte previews worden zeven dagen onthouden. Pauzeredenen staan in `/api/poc/catalog-status`. De grenzen zijn conservatief en geen bewijs dat de catalogus compleet is.
+
+De backend logt niet meer iedere twintig minuten opnieuw in. Bij HTTP 401, 403 of 429 vanuit een geauthenticeerde route wordt verdere accounttoegang in het proces geblokkeerd, zonder automatisch opnieuw inloggen. Controleer het account voordat je de server opnieuw start. De eerste login bij prewarming of afspelen kan nog altijd een andere gebruiker verdringen als het abonnement geen gelijktijdig gebruik toestaat.
+
+Offline regressietests: `python -m unittest discover -s tests -p test_session_safety.py`.
 
 ## Afspelen in AudioBooth
 

@@ -1,0 +1,21 @@
+name: Nextory session safety
+on:
+  pull_request:
+    paths:
+      - 'app/**'
+      - 'tests/test_session_safety.py'
+      - 'requirements.txt'
+      - '.github/workflows/nextory-session-safety.yml'
+permissions:
+  contents: read
+jobs:
+  offline-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: pip install -r requirements.txt
+      - run: python -m compileall -q app
+      - run: python -m unittest discover -s tests -p test_session_safety.py
