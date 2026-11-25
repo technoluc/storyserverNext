@@ -35,6 +35,46 @@ class AccountSafetyTests(unittest.TestCase):
                     self.assertEqual(get.call_count, 1)
                     post.assert_not_called()
 
+    def test_live_search_uses_only_public_session(self):
+        backend = NextoryBackend()
+        response = Mock(status_code=200)
+        response.json.return_value = {"products": []}
+        from unittest.mock import MagicMock
+        context = MagicMock()
+        context.__enter__.return_value = response
+        with patch.object(backend._discovery_public, "get", return_value=context) as public, \
+             patch.object(backend._api, "get") as private_get, \
+             patch.object(backend._api, "post") as private_post:
+            self.assertEqual(backend.search_catalog("test"), [])
+            public.assert_called_once()
+            private_get.assert_not_called()
+            private_post.assert_not_called()
+
+    def test_public_preview_does_not_authenticate(self):
+        backend = NextoryBackend()
+        from unittest.mock import MagicMock
+        context = MagicMock()
+        context.__enter__.return_value = Mock(status_code=404)
+        with patch.object(backend._discovery_public, "get", return_value=context) as public, \
+             patch.object(backend._api, "post") as private_post:
+            self.assertIsNone(backend.get_product_preview(12345))
+            public.assert_called_once()
+            private_post.assert_not_called()
+
+    def test_public_denial_never_retries_using_account(self):
+        backend = NextoryBackend()
+        from unittest.mock import MagicMock
+        context = MagicMock()
+        context.__enter__.return_value = Mock(status_code=403)
+        with patch.object(backend._discovery_public, "get", return_value=context) as public, \
+             patch.object(backend._api, "post") as private_post:
+            for _ in range(2):
+                with self.assertRaises(NextoryError):
+                    backend.search_catalog("test")
+            public.assert_called_once()
+            private_post.assert_not_called()
+            self.assertFalse(backend.access_paused)
+
     def test_missing_cover_does_not_login(self):
         backend = NextoryBackend()
         with patch.object(backend, "_ensure_login") as login:
