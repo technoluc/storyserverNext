@@ -965,7 +965,7 @@ async def search(library_id: str, q: str = '', _: bool = Depends(authenticated))
     entries, _ = await lightweight_catalog()
     entries = [p for p in entries if query.casefold() in
                (' '.join((p.title, *p.authors, p.series_name or ''))).casefold()][:30]
-    if os.getenv('CATALOG_LIVE_SEARCH', '0') == '1':
+    if os.getenv('CATALOG_LIVE_SEARCH', '1') == '1':
         try:
             previews = await run_in_threadpool(search_dutch_catalog, query)
             if previews:
@@ -986,7 +986,7 @@ async def discovery_status(_: bool = Depends(authenticated)):
     return {'mode': 'dynamic-nextory-discovery',
             'visibleLibraries': 1, 'collections': len(COLLECTION_SHELVES),
             'fastMetadata': True, 'initialHlsRoundTripRemoved': True,
-            'search': 'nextory-discovery-api' if os.getenv('CATALOG_LIVE_SEARCH', '0') == '1' else 'local-index',
+            'search': 'nextory-public-discovery-with-local-fallback' if os.getenv('CATALOG_LIVE_SEARCH', '1') == '1' else 'local-index',
             'categories': [code for code, _, _ in CATEGORIES],
             'automaticRefresh': os.getenv('CATALOG_AUTOSYNC', '0') == '1',
             'automaticCollectionFill': os.getenv('CATALOG_AUTOSYNC', '0') == '1',
@@ -1047,7 +1047,7 @@ async def item(item_id: str, expanded: int = 0, _: bool = Depends(authenticated)
         result = preview_detail(preview)
     # NEXTORY_DETAIL_PREWARM_V1: schedule only after detail is ready.
     # Catalog/library listings and cover requests never call schedule().
-    if expanded == 1 and os.getenv('NEXTORY_DETAIL_PREWARM', '0') == '1':
+    if expanded == 1 and os.getenv('NEXTORY_DETAIL_PREWARM', '1') == '1' and not nextory.access_paused:
         logging.getLogger('uvicorn.error').info('POC_HLS_BOOK stage=detail book=%s', book_ref(book_id))
         prewarm_manager.schedule(book_id)
         if cached:
