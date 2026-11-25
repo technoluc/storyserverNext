@@ -392,7 +392,7 @@ def _prepare_category(shelf: str, page: int, limit: int):
 
 
 def _library_list(shelf: str, page: int, limit: int):
-    _prepare_category(shelf, page, limit)
+    # Browsing is always local; it must not initiate upstream account activity.
     return catalog_index.select(shelf, page, limit)
 
 
@@ -401,17 +401,7 @@ async def dynamic_listing(shelf: str, page: int = 0, limit: int = 20):
 
 
 def _collection_listing(shelf: str, page: int, limit: int | None):
-    if os.getenv('CATALOG_AUTOSYNC', '1') == '1':
-        return catalog_index.select(shelf, page, limit) if limit is not None else catalog_index.select(shelf, 0, -1)
-    if limit is not None:
-        return _library_list(shelf, page, limit)
-    if shelf.startswith('category:'):
-        _, count = catalog_index.select(shelf, 0, 1)
-        target = max(COLLECTION_INITIAL_TARGET, count + COLLECTION_GROWTH)
-        _prepare_category(shelf, 0, target)
-    # Audiobookshelf collection clients generally expect a flat list of all
-    # currently indexed books and do not send page/limit.
-    return catalog_index.select(shelf, 0, -1)
+    return catalog_index.select(shelf, page, limit) if limit is not None else catalog_index.select(shelf, 0, -1)
 
 
 async def _discovery_poller():
@@ -447,7 +437,7 @@ async def _collection_poller():
 
 @app.on_event('startup')
 async def start_discovery():
-    if os.getenv('CATALOG_AUTOSYNC', '1') == '1':
+    if os.getenv('CATALOG_AUTOSYNC', '0') == '1':
         app.state.catalog_task = asyncio.create_task(_discovery_poller())
         app.state.collection_task = asyncio.create_task(_collection_poller())
 
@@ -968,16 +958,17 @@ async def search(library_id: str, q: str = '', _: bool = Depends(authenticated))
         return {'book': [], 'authors': [], 'series': [], 'tags': []}
     if len(query) > 100:
         raise HTTPException(status_code=400, detail='Search is too long')
-    try:
-        previews = await run_in_threadpool(search_dutch_catalog, query)
-        if previews:
-            await run_in_threadpool(catalog_index.upsert, previews)
-        entries = [CatalogPreview.from_dict(p) for p in previews]
-    except (NextoryError, AttributeError) as exc:
-        logging.warning('Nextory live search unavailable: %s', exc)
-        entries, _ = await dynamic_listing('all', 0, 1000)
-        entries = [p for p in entries if query.casefold() in
-                   (' '.join((p.title, *p.authors, p.series_name or ''))).casefold()][:30]
+    entries, _ = await lightweight_catalog()
+    entries = [p for p in entries if query.casefold() in
+               (' '.join((p.title, *p.authors, p.series_name or ''))).casefold()][:30]
+    if os.getenv('CATALOG_LIVE_SEARCH', '0') == '1':
+        try:
+            previews = await run_in_threadpool(search_dutch_catalog, query)
+            if previews:
+                await run_in_threadpool(catalog_index.upsert, previews)
+                entries = [CatalogPreview.from_dict(p) for p in previews]
+        except (NextoryError, AttributeError) as exc:
+            logging.warning('Nextory live search unavailable: %s', exc)
     return {'book': [{'libraryItem': summary_item(preview),
                       'matchKey': 'title', 'matchText': preview.title}
                      for preview in entries],
@@ -991,10 +982,10 @@ async def discovery_status(_: bool = Depends(authenticated)):
     return {'mode': 'dynamic-nextory-discovery',
             'visibleLibraries': 1, 'collections': len(COLLECTION_SHELVES),
             'fastMetadata': True, 'initialHlsRoundTripRemoved': True,
-            'search': 'nextory-discovery-api',
+            'search': 'nextory-discovery-api' if os.getenv('CATALOG_LIVE_SEARCH', '0') == '1' else 'local-index',
             'categories': [code for code, _, _ in CATEGORIES],
-            'automaticRefresh': os.getenv('CATALOG_AUTOSYNC', '1') == '1',
-            'automaticCollectionFill': os.getenv('CATALOG_AUTOSYNC', '1') == '1',
+            'automaticRefresh': os.getenv('CATALOG_AUTOSYNC', '0') == '1',
+            'automaticCollectionFill': os.getenv('CATALOG_AUTOSYNC', '0') == '1',
             **(await run_in_threadpool(catalog_index.statistics))}
 
 
@@ -1051,7 +1042,7 @@ async def item(item_id: str, expanded: int = 0, _: bool = Depends(authenticated)
         result = preview_detail(preview)
     # NEXTORY_DETAIL_PREWARM_V1: schedule only after detail is ready.
     # Catalog/library listings and cover requests never call schedule().
-    if expanded == 1:
+    if expanded == 1 and os.getenv('NEXTORY_DETAIL_PREWARM', '0') == '1':
         logging.getLogger('uvicorn.error').info('POC_HLS_BOOK stage=detail book=%s', book_ref(book_id))
         prewarm_manager.schedule(book_id)
         if cached:
