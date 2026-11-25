@@ -30,6 +30,8 @@ AudioBooth krijgt standaard een virtuele M4B voor ieder boek. De server maakt de
 
 Heb je eerder `NEXTORY_TEST_VIRTUAL_M4B_BOOK` in je `.env` gezet, verwijder dan die regel of zet de waarde op `all` om alle boeken te gebruiken.
 
+Op de bibliotheekpagina toont **Verder luisteren** boeken met opgeslagen, onafgeronde voortgang. **Recent getest** toont boeken waarvoor de server een afspeelsessie heeft aangemaakt, ook als die poging verderop vastliep. De recentste 2.000 sessies blijven in het Docker-volume staan, inclusief titel, tijd en afspeelformaat. Een afspeelsessie geeft aan dat Play is geprobeerd. Luistertijd en positie in de geschiedenis komen uit de voortgang die de speler doorgeeft.
+
 ## Bestaande installatie bijwerken
 
 Voeg de twee Nextory-variabelen toe aan je bestaande `.env` en behoud je huidige serverwachtwoord. Als `TEST_AUTH_SECRET` al ingesteld is, laat die waarde dan staan om bestaande aanmeldsessies te behouden. Bij een nieuwe installatie maakt de server zelf een sessiesleutel in het Docker-volume, dat ook je luistervoortgang bewaart. Gebruik bij een upgrade dezelfde Compose-projectnaam om dat volume te blijven gebruiken.

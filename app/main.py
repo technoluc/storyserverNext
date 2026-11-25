@@ -16,6 +16,7 @@ import math
 import os
 import re
 import secrets
+import sqlite3
 import tempfile
 import time
 from collections import defaultdict
@@ -35,7 +36,7 @@ from .prewarm import PrewarmManager  # NEXTORY_DETAIL_PREWARM_V1
 from .hls_delivery import build_resource_response  # HLS_FIRSTPLAY_SERVER_V1
 from .hls_root import direct_media_playlist  # NEXTORY_HLS_DIRECT_MEDIA_V1
 from .hls_book import BookPlanCache, book_ref, PLAY_TOTAL_BUDGET_SECONDS  # NEXTORY_SINGLE_PRESENTATION_V2
-from .progress import progress_store
+from .progress import listening_history, progress_store
 from . import fixed_m4b  # NEXTORY_FIXED_M4B_V1
 from .discovery import (CATEGORIES, CatalogPreview, CatalogIndex, NextoryError as DiscoveryError,
                         REFRESH_SECONDS, catalog_index, item_id_for)
@@ -143,12 +144,13 @@ def _progress_json(book_id: int) -> dict | None:
     current = progress_store.get(book_id)
     if current is None:
         return None
+    finished = current['currentTime'] >= current['duration']
     return {'id': media_id_for(book_id), 'libraryItemId': item_id_for(book_id),
             'episodeId': None, 'mediaItemId': media_id_for(book_id),
             'duration': current['duration'], 'currentTime': current['currentTime'],
             'progress': current['currentTime'] / current['duration'],
-            'lastUpdate': current['lastUpdate'], 'isFinished': False,
-            'hideFromContinueListening': False, 'finishedAt': None,
+            'lastUpdate': current['lastUpdate'], 'isFinished': finished,
+            'hideFromContinueListening': False, 'finishedAt': current['lastUpdate'] if finished else None,
             'startedAt': int(current.get('startedAt') or current['lastUpdate'])}  # AUDIOBOOTH_COMPAT_V1
 
 
@@ -616,9 +618,31 @@ async def refresh(req: Request):
 
 
 @app.get('/api/me/progress')
-@app.get('/api/me/items-in-progress')
 async def progress(_: bool = Depends(authenticated)):
     return [p for n in progress_store.all() if (p := _progress_json(n))]
+
+
+def items_in_progress(limit: int):
+    rows = sorted(progress_store.all().items(),
+                  key=lambda row: row[1]['lastUpdate'], reverse=True)
+    items = []
+    for book_id, saved in rows:
+        if not 0 < saved['currentTime'] < saved['duration']:
+            continue
+        preview = catalog_index.lookup(book_id)
+        if preview:
+            item = summary_item(preview)
+            item['media']['duration'] = saved['duration']
+            item['progressLastUpdate'] = saved['lastUpdate']
+            items.append(item)
+            if len(items) == limit:
+                break
+    return items
+
+
+@app.get('/api/me/items-in-progress')
+async def continue_listening(limit: int = 25, _: bool = Depends(authenticated)):
+    return await run_in_threadpool(items_in_progress, max(1, min(limit, 100)))
 
 
 @app.get('/api/me/progress/{item_id}')
@@ -692,6 +716,19 @@ async def personalized(library_id: str, _: bool = Depends(authenticated)):
     # website scans. All rows are satisfied by the existing metadata index.
     def from_index():
         rows = []
+        saved = items_in_progress(12)
+        if saved:
+            rows.append({'id': 'continue-listening', 'label': 'Continue Listening',
+                         'labelStringKey': 'LabelContinueListening', 'type': 'book',
+                         'entities': saved, 'total': len(saved)})
+        try:
+            recent = [summary_item(preview) for book_id in listening_history.recent_books(12)
+                      if (preview := catalog_index.lookup(book_id))]
+        except (OSError, sqlite3.Error):
+            recent = []
+        if recent:
+            rows.append({'id': 'nextory-recent-playback', 'label': 'Recent getest',
+                         'type': 'book', 'entities': recent, 'total': len(recent)})
         for shelf, label in [('new', 'Nieuw ontdekt'),
                              ('all', 'Alle ontdekte luisterboeken')]:
             previews, count = catalog_index.select(shelf, 0, 12)
@@ -1032,6 +1069,17 @@ async def play(item_id: str, req: Request, _: bool = Depends(authenticated)):
     }
     if engine is not None:
         fixed_m4b.patch_payload(result, engine)
+    history = {key: result[key] for key in (
+        'id', 'userId', 'libraryId', 'libraryItemId', 'bookId', 'episodeId', 'mediaType',
+        'mediaMetadata', 'displayTitle', 'displayAuthor', 'coverPath', 'duration',
+        'playMethod', 'date', 'dayOfWeek', 'startTime', 'currentTime', 'timeListening',
+        'startedAt', 'updatedAt')}
+    history.update(createdAt=now, playbackFormat='m4b' if engine is not None else 'hls',
+                   bookRef=ref)
+    try:
+        await run_in_threadpool(listening_history.add, info.book_id, history)
+    except (OSError, sqlite3.Error):
+        logging.warning('Could not save playback history')
     return result
 
 
@@ -1182,7 +1230,16 @@ async def sync_session(session_id: str, req: Request, _: bool = Depends(authenti
     except OSError as exc:
         logging.error('Failed to persist audiobook progress: %s', type(exc).__name__)
         raise HTTPException(status_code=503, detail='Progress store not writable') from exc
+    await save_history_position(session)
     return Response(content='OK', media_type='text/plain')
+
+
+async def save_history_position(session):
+    try:
+        await run_in_threadpool(listening_history.update, session.id,
+                                current_time=session.current_time, listened=session.time_listening)
+    except (OSError, sqlite3.Error):
+        logging.warning('Could not update playback history')
 
 
 @app.post('/api/session/{session_id}/close')
@@ -1199,6 +1256,7 @@ async def close_session(session_id: str, req: Request, _: bool = Depends(authent
                                             current_time=current, duration=session.duration)
         except (ValueError, TypeError, OSError):
             pass  # Last successful /sync already persisted progress.
+        await save_history_position(session)
     registry.close(session_id)
     return Response(content='OK', media_type='text/plain')
 
@@ -1209,10 +1267,25 @@ async def listening_stats(_: bool = Depends(authenticated)):
     return {'totalTime': 0.0, 'today': 0.0, 'days': {}, 'items': {}}
 
 
+async def history_page(page: int, items_per_page: int, book_id: int | None = None):
+    if not 0 <= page <= 10000 or not 1 <= items_per_page <= 100:
+        raise HTTPException(status_code=400, detail='Invalid history pagination')
+    try:
+        return await run_in_threadpool(listening_history.page, page, items_per_page, book_id)
+    except (OSError, sqlite3.Error) as exc:
+        raise HTTPException(status_code=503, detail='Playback history unavailable') from exc
+
+
+@app.get('/api/sessions')
+async def all_listening_sessions(page: int = 0, itemsPerPage: int = 10,
+                                 _: bool = Depends(authenticated)):
+    return await history_page(page, itemsPerPage)
+
+
 @app.get('/api/me/item/listening-sessions/{item_id}')
-async def listening_sessions(item_id: str, _: bool = Depends(authenticated)):
-    id_to_book(item_id)
-    return {'numPages': 0, 'page': 0, 'itemsPerPage': 10, 'sessions': []}
+async def listening_sessions(item_id: str, page: int = 0, itemsPerPage: int = 10,
+                             _: bool = Depends(authenticated)):
+    return await history_page(page, itemsPerPage, id_to_book(item_id))
 
 
 @app.get('/api/items/{item_id}/file/{file_id}')

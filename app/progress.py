@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import math
 import os
+import sqlite3
 import tempfile
 import threading
 import time
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 STORE_PATH = Path(os.environ.get('PROGRESS_FILE', '/state/progress.json'))
@@ -65,3 +67,55 @@ class ProgressStore:
             return dict(value)
 
 progress_store = ProgressStore()
+
+
+class ListeningHistory:
+    """Persist playback attempts independently of audio and playback sessions."""
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    @contextmanager
+    def _connection(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with closing(sqlite3.connect(self.path, timeout=5)) as db, db:
+            db.execute('''CREATE TABLE IF NOT EXISTS attempts (
+                id TEXT UNIQUE NOT NULL, book_id INTEGER NOT NULL,
+                payload TEXT NOT NULL)''')
+            yield db
+
+    def add(self, book_id: int, payload: dict):
+        with self._connection() as db:
+            db.execute('INSERT INTO attempts (id, book_id, payload) VALUES (?, ?, ?)',
+                       (payload['id'], book_id, json.dumps(payload, ensure_ascii=False)))
+            db.execute('''DELETE FROM attempts WHERE rowid < (
+                SELECT rowid FROM attempts ORDER BY rowid DESC LIMIT 1 OFFSET 1999)''')
+
+    def update(self, session_id: str, *, current_time: float, listened: float):
+        with self._connection() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT payload FROM attempts WHERE id = ?', (session_id,)).fetchone()
+            if row:
+                payload = json.loads(row[0])
+                payload.update(currentTime=current_time, timeListening=listened,
+                               updatedAt=int(time.time() * 1000))
+                db.execute('UPDATE attempts SET payload = ? WHERE id = ?',
+                           (json.dumps(payload, ensure_ascii=False), session_id))
+
+    def page(self, page: int, size: int, book_id: int | None = None):
+        where, args = (' WHERE book_id = ?', (book_id,)) if book_id is not None else ('', ())
+        with self._connection() as db:
+            total = db.execute('SELECT COUNT(*) FROM attempts' + where, args).fetchone()[0]
+            rows = db.execute('SELECT payload FROM attempts' + where +
+                              ' ORDER BY rowid DESC LIMIT ? OFFSET ?', (*args, size, page * size))
+            return {'total': total, 'numPages': (total + size - 1) // size, 'page': page,
+                    'itemsPerPage': size, 'sessions': [json.loads(row[0]) for row in rows]}
+
+    def recent_books(self, limit: int):
+        with self._connection() as db:
+            return [row[0] for row in db.execute(
+                'SELECT book_id FROM attempts GROUP BY book_id ORDER BY MAX(rowid) DESC LIMIT ?',
+                (limit,))]
+
+
+listening_history = ListeningHistory(STORE_PATH.with_name('listening-history.sqlite3'))
