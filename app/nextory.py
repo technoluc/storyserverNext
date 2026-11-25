@@ -129,6 +129,12 @@ class NextoryBackend:
         self._manifest_cache_bytes = 0
 
     def _credentials(self) -> tuple[str, str]:
+        username = os.environ.get('NEXTORY_USERNAME')
+        password = os.environ.get('NEXTORY_PASSWORD')
+        if username is not None or password is not None:
+            if not username or not password:
+                raise NextoryError('Set both NEXTORY_USERNAME and NEXTORY_PASSWORD')
+            return username, password
         try:
             with CONFIG_PATH.open('rb') as handle:
                 config = tomllib.load(handle)

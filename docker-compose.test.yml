@@ -1,4 +1,0 @@
-services:
-  nextory-abs-poc:
-    container_name: nextory-abs-poc-test
-    image: nextory-abs-poc-test:dev

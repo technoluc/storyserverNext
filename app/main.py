@@ -16,6 +16,7 @@ import math
 import os
 import re
 import secrets
+import tempfile
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -42,10 +43,37 @@ from .discovery import (CATEGORIES, CatalogPreview, CatalogIndex, NextoryError a
 COMPAT_VERSION = '2.25.0'  # Native iOS uses public/session direct-play route since 2.22.
 USERNAME = os.getenv('TEST_USERNAME', 'test')
 PASSWORD = os.getenv('TEST_PASSWORD', '')
-SECRET = os.getenv('TEST_AUTH_SECRET', '')
 BOOKS_FILE = Path(os.getenv('NEXTORY_BOOKS_FILE', '/run/nextory/book-ids.txt'))
-if len(PASSWORD) < 12 or len(SECRET) < 32:
-    raise RuntimeError('Set TEST_PASSWORD (12+ chars) and TEST_AUTH_SECRET (32+ chars)')
+if len(PASSWORD) < 12:
+    raise RuntimeError('Set TEST_PASSWORD to a local server password of at least 12 characters')
+
+
+def load_auth_secret(path: Path) -> str:
+    configured = os.getenv('TEST_AUTH_SECRET')
+    if configured is not None:
+        secret = configured
+    else:
+        if not path.exists():
+            # Publish a complete, private file before another process can read it.
+            temporary = tempfile.NamedTemporaryFile(
+                dir=path.parent, mode='w', encoding='ascii', delete=False)
+            temporary_path = Path(temporary.name)
+            try:
+                with temporary:
+                    temporary.write(secrets.token_urlsafe(48))
+                try:
+                    os.link(temporary_path, path)
+                except FileExistsError:
+                    pass
+            finally:
+                temporary_path.unlink()
+        secret = path.read_text(encoding='ascii')
+    if len(secret) < 32:
+        raise RuntimeError('The server session signing secret must be at least 32 characters')
+    return secret
+
+
+SECRET = load_auth_secret(progress_store.path.with_name('auth-secret'))
 
 LIBRARY_ID = str(uuid5(NAMESPACE_URL, 'nextory-abs-poc:library'))
 FOLDER_ID = str(uuid5(NAMESPACE_URL, 'nextory-abs-poc:folder'))
@@ -599,8 +627,15 @@ async def health():
         books = list(configured_ids())
     except NextoryError:
         books = []
-    return {'status': 'ok', 'audioEnabled': CONFIG_PATH.is_file(),
-            'mode': 'nextory-multiple-hls-tracks', 'configMounted': CONFIG_PATH.is_file(),
+    config_mounted = CONFIG_PATH.is_file()
+    try:
+        nextory._credentials()
+    except NextoryError:
+        audio_enabled = False
+    else:
+        audio_enabled = True
+    return {'status': 'ok', 'audioEnabled': audio_enabled,
+            'mode': 'nextory-multiple-hls-tracks', 'configMounted': config_mounted,
             'configuredBookIds': books}
 
 

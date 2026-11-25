@@ -5,14 +5,12 @@ services:
     env_file:
       - .env
     environment:
-      - NEXTORY_CONFIG_PATH=/run/nextory/audiobook-dl.toml
-      - NEXTORY_BOOKS_FILE=/run/nextory-book-ids.txt
-      - PROGRESS_FILE=/state/progress.json
+      NEXTORY_USERNAME: "${NEXTORY_USERNAME:?Set NEXTORY_USERNAME in .env}"
+      NEXTORY_PASSWORD: "${NEXTORY_PASSWORD:?Set NEXTORY_PASSWORD in .env}"
+      TEST_PASSWORD: "${TEST_PASSWORD:?Set TEST_PASSWORD in .env}"
+      NEXTORY_BOOKS_FILE: /run/nextory-book-ids.txt
+      PROGRESS_FILE: /state/progress.json
     volumes:
-      - type: bind
-        source: ${NEXTORY_CONFIG_SOURCE:?Run sh configure-nextory.sh first}
-        target: /run/nextory
-        read_only: true
       - type: bind
         source: ./book-ids.txt
         target: /run/nextory-book-ids.txt
@@ -32,10 +30,5 @@ services:
       - no-new-privileges:true
     pids_limit: 100
     mem_limit: 256m
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=3)"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
 volumes:
   nextory-progress:

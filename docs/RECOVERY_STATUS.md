@@ -1,5 +1,7 @@
 # Recovery status
 
+This page describes the original recovered snapshot. For the current Compose setup, see the [README](../README.md).
+
 Recovered on 25 November 2026 from the available ChatGPT export and the previously generated `nextory-abs-virtual-poc-test-sanitized.zip` snapshot.
 
 This repository is an archival proof of concept, not a production release. It contains no `.env`, provider credential file, state database, downloaded audiobook, media key, access token, or refresh token. Runtime credentials must remain outside Git and are mounted read-only by Docker Compose.
