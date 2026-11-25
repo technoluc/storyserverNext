@@ -24,6 +24,12 @@ Met `docker compose ps` zie je of de server gezond is. Met `docker compose logs 
 
 De server haalt bij het starten automatisch luisterboekmetadata op bij Nextory en bewaart die in het Docker-volume. De bibliotheek kan bij een eerste start kort leeg zijn. Zoeken gebruikt Nextory live, en als je een genrecollectie opent kan de server meer titels aan de lokale index toevoegen. De bibliotheek groeit mee met die zoek- en ontdekacties. Je hoeft geen boek-ID’s in te vullen.
 
+## Afspelen in AudioBooth
+
+AudioBooth krijgt standaard een virtuele M4B voor ieder boek. De server maakt de audio op aanvraag met FFmpeg. Als de M4B-sessie niet kan worden voorbereid, bijvoorbeeld omdat beide M4B-sessieplaatsen bezet zijn, gebruikt de server de bestaande HLS-route. Andere clients blijven HLS gebruiken.
+
+Heb je eerder `NEXTORY_TEST_VIRTUAL_M4B_BOOK` in je `.env` gezet, verwijder dan die regel of zet de waarde op `all` om alle boeken te gebruiken.
+
 ## Bestaande installatie bijwerken
 
 Voeg de twee Nextory-variabelen toe aan je bestaande `.env` en behoud je huidige serverwachtwoord. Als `TEST_AUTH_SECRET` al ingesteld is, laat die waarde dan staan om bestaande aanmeldsessies te behouden. Bij een nieuwe installatie maakt de server zelf een sessiesleutel in het Docker-volume, dat ook je luistervoortgang bewaart. Gebruik bij een upgrade dezelfde Compose-projectnaam om dat volume te blijven gebruiken.

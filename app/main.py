@@ -29,7 +29,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from .hls_proxy import registry, rewrite_playlist
+from .hls_proxy import FixedSessionCapacity, registry, rewrite_playlist
 from .nextory import BookInfo, CONFIG_PATH, NextoryError, TrackPart, nextory
 from .prewarm import PrewarmManager  # NEXTORY_DETAIL_PREWARM_V1
 from .hls_delivery import build_resource_response  # HLS_FIRSTPLAY_SERVER_V1
@@ -852,7 +852,9 @@ async def item(item_id: str, expanded: int = 0, _: bool = Depends(authenticated)
             pass
     if cached:
         info, tracks = cached
-        if fixed_m4b.enabled(book_id):
+        # Catalog details are shared by clients. In all-book mode, choose
+        # the virtual presentation only in the client-specific play response.
+        if fixed_m4b.enabled(book_id, allow_all=False):
             try:
                 parts = fixed_m4b.timeline(tracks)
                 header, packets, samples = fixed_m4b.make_index(parts[-1].end)
@@ -918,26 +920,18 @@ async def play(item_id: str, req: Request, _: bool = Depends(authenticated)):
             raise HTTPException(status_code=503, detail='Book preparation is still running; reopen details and retry') from None
     else:
         info, tracks = await book_and_layout(item_id)
-    use_fixed = is_audiobooth and fixed_m4b.enabled(book_id)
+    if not tracks:
+        raise HTTPException(status_code=503, detail='Book has no playable tracks')
     chapters = tracks
     playback_tracks = tracks
-    plan = None
     reason = 'other_client' if not is_audiobooth else 'not_multiple_parts'
-    if is_audiobooth and len(tracks) > 1 and not use_fixed:
-        plan, reason = await book_plan_cache.obtain(nextory, info.book_id, tracks,
-            timeout=max(0., PLAY_TOTAL_BUDGET_SECONDS - (time.monotonic() - started)))
-        # Never silently call a timing/capacity fallback a one-track test.
-        # Genuine incompatible VODs retain the original multi-part contract.
-        if plan is None and reason in {'plan_pending', 'capacity', 'generation_pending', 'closed'}:
-            logging.getLogger('uvicorn.error').info(
-                'POC_HLS_BOOK stage=play mode=pending book=%s reason=%s', ref, reason)
-            raise HTTPException(status_code=503, detail='Book preparation is still running; reopen details and retry')
     previous = progress_store.get(info.book_id)
     previous_time = (float(previous['currentTime']) if previous else 0.0)
     duration = round(tracks[-1].start + tracks[-1].duration, 3)
     start_time = previous_time if previous_time < duration - 10 else 0.0
     session = None
-    if use_fixed:
+    engine = None
+    if is_audiobooth and fixed_m4b.enabled(book_id):
         try:
             # The internal source tracks are retained. AudioBooth sees only
             # one classic M4B track, using the same existing playback session.
@@ -946,16 +940,36 @@ async def play(item_id: str, req: Request, _: bool = Depends(authenticated)):
                                       fixed_presentation=True)
             engine = fixed_m4b.FixedM4B(tracks, fixed_m4b.LocalPlaybackSource(session))
             session.fixed_m4b = engine
+        except (fixed_m4b.MediaError, FixedSessionCapacity) as exc:
+            if session is not None:
+                registry.close(session.id)
+            session = None
+            engine = None
+            logging.getLogger('uvicorn.error').info(
+                'POC_FIXED_M4B event=fallback book=%s reason=%s', ref, str(exc))
+        except NextoryError as exc:
+            if session is not None:
+                registry.close(session.id)
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except Exception:
+            if session is not None:
+                registry.close(session.id)
+            raise
+        else:
             duration = round(engine.duration, 3)
             session.duration = duration
             playback_tracks = (TrackPart(1, tracks[0].uri, 0., duration, info.title),)
             logging.getLogger('uvicorn.error').info(
                 'POC_FIXED_M4B event=play book=%s chapters=%d audio_tracks=1 duration=%.3f header_bytes=%d virtual_bytes=%d chunks=%d',
                 ref, len(chapters), duration, engine.media_start, engine.size, engine.chunk_count)
-        except Exception as exc:
-            if session is not None: registry.close(session.id)
-            logging.getLogger('uvicorn.error').warning('POC_FIXED_M4B event=prepare_error type=%s', type(exc).__name__)
-            raise HTTPException(status_code=503, detail='Virtual M4B preparation failed') from None
+    plan = None
+    if session is None and is_audiobooth and len(tracks) > 1:
+        plan, reason = await book_plan_cache.obtain(nextory, info.book_id, tracks,
+            timeout=max(0., PLAY_TOTAL_BUDGET_SECONDS - (time.monotonic() - started)))
+        if plan is None and reason in {'plan_pending', 'capacity', 'generation_pending', 'closed'}:
+            logging.getLogger('uvicorn.error').info(
+                'POC_HLS_BOOK stage=play mode=pending book=%s reason=%s', ref, reason)
+            raise HTTPException(status_code=503, detail='Book preparation is still running; reopen details and retry')
     if plan is not None:
         full_duration = round(plan.chapters[-1].start + plan.chapters[-1].duration, 3)
         candidate = (TrackPart(1, tracks[0].uri, 0.0, full_duration, info.title),)
@@ -1017,8 +1031,8 @@ async def play(item_id: str, req: Request, _: bool = Depends(authenticated)):
                         for track in playback_tracks],
         'libraryItem': library_item,
     }
-    if use_fixed:
-        fixed_m4b.patch_payload(result, session.fixed_m4b)
+    if engine is not None:
+        fixed_m4b.patch_payload(result, engine)
     return result
 
 

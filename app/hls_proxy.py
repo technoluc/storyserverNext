@@ -22,6 +22,10 @@ MAX_SESSIONS = 30
 URI_ATTR_RE = re.compile(r'URI="([^"]+)"')
 
 
+class FixedSessionCapacity(NextoryError):
+    pass
+
+
 @dataclass(frozen=True)
 class Resource:
     url: str
@@ -123,7 +127,7 @@ class Registry:
             if len(self._sessions) >= MAX_SESSIONS:
                 raise NextoryError('Too many playback sessions')
             if fixed_presentation and sum(s.fixed_reservation for s in self._sessions.values()) >= 2:
-                raise NextoryError('Virtual M4B session capacity reached')
+                raise FixedSessionCapacity('Virtual M4B session capacity reached')
             if book_presentation and sum(s.book_playlist is not None for s in self._sessions.values()) >= 4:
                 raise NextoryError('Single presentation capacity reached')
             duration = round(tracks[-1].start + tracks[-1].duration, 3)

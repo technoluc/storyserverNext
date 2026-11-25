@@ -42,15 +42,15 @@ MAX_ACTIVE = 4
 SEND_RATE = 256 * 1024
 BURST = 512 * 1024
 FFMPEG_TIMEOUT = 25
-TARGET_BOOK = 7207495
 MARKER = 'NEXTORY_FIXED_M4B_V1'
 
 class MediaError(RuntimeError):
     pass
 
 
-def enabled(book_id: int) -> bool:
-    return book_id == TARGET_BOOK and os.environ.get('NEXTORY_TEST_VIRTUAL_M4B_BOOK') == str(TARGET_BOOK)
+def enabled(book_id: int, *, allow_all: bool = True) -> bool:
+    selection = os.getenv('NEXTORY_TEST_VIRTUAL_M4B_BOOK', '').strip().lower()
+    return selection == str(book_id) or (allow_all and selection == 'all')
 
 # This template is generated locally by FFmpeg from two packets of silent
 # 16-bit PCM. Only container metadata is included, not any audio payload.

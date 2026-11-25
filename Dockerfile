@@ -1,6 +1,6 @@
 FROM python:3.13-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
-ENV NEXTORY_TEST_VIRTUAL_M4B_BOOK=7207495
+ENV NEXTORY_TEST_VIRTUAL_M4B_BOOK=all
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /srv/poc
 COPY requirements.txt .
