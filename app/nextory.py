@@ -457,7 +457,8 @@ class NextoryBackend:
                 del self._duration_worker.api
                 del self._duration_worker.public
 
-    def remote_get(self, url: str, *, byte_range: str | None = None) -> requests.Response:
+    def remote_get(self, url: str, *, byte_range: str | None = None,
+                   account_auth: bool = True) -> requests.Response:
         headers = {'Accept': '*/*'}
         if byte_range and len(byte_range) < 80 and byte_range.startswith('bytes='):
             headers['Range'] = byte_range
@@ -466,7 +467,7 @@ class NextoryBackend:
             host = urlparse(url).hostname
             worker_api = getattr(self._duration_worker, 'api', None)
             worker_public = getattr(self._duration_worker, 'public', None)
-            if host == 'api.nextory.com':
+            if host == 'api.nextory.com' and account_auth:
                 if self._access_blocked:
                     raise NextoryError('Nextory access paused after upstream rejection')
                 if worker_api is None:
@@ -479,7 +480,7 @@ class NextoryBackend:
                                        stream=True, allow_redirects=False)
             except requests.RequestException as exc:
                 raise NextoryError(f'Nextory HLS network error ({type(exc).__name__})') from exc
-            if host == 'api.nextory.com' and response.status_code in (401, 403, 429):
+            if account_auth and host == 'api.nextory.com' and response.status_code in (401, 403, 429):
                 self._access_blocked = True
                 response.close()
                 raise NextoryError('Nextory asset access rejected; automatic access paused')
@@ -682,11 +683,11 @@ class NextoryBackend:
             cached = self._covers.get(book_id)
             if cached and time.monotonic() - cached[1] < 60 * 60:
                 return cached[0]
-            preview = None if cover_url_hint else self.get_product_preview(book_id)
-            cover_url = cover_url_hint or (preview['cover_url'] if preview else self.get_book(book_id).cover_url)
+            # Cover browsing must never open a reader session or fetch an audio package.
+            cover_url = cover_url_hint
             if not cover_url:
                 raise NextoryError('Nextory product has no cover URL')
-            response = self.remote_get(cover_url)
+            response = self.remote_get(cover_url, account_auth=False)
             try:
                 if response.status_code != 200:
                     raise NextoryError(f'Nextory cover HTTP {response.status_code}')
