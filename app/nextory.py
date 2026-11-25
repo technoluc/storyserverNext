@@ -117,6 +117,7 @@ class NextoryBackend:
         self._api = requests.Session()
         self._public = requests.Session()
         self._authed_at = 0.0
+        self._access_blocked = False
         self._duration_worker = threading.local()  # NEXTORY_LAYOUT_PARALLEL_V1
         # Dedicated device identity for this test backend instance.
         self._device_id = str(uuid.uuid4())
@@ -147,6 +148,11 @@ class NextoryBackend:
         return str(entry['username']), str(entry['password'])
 
     def _checked_json(self, response: requests.Response, label: str) -> dict:
+        if response.status_code in (401, 403, 429):
+            self._access_blocked = True
+            logging.getLogger('uvicorn.error').warning(
+                'NEXTORY_ACCESS_PAUSED endpoint=%s status=%d; no automatic reauthentication',
+                label, response.status_code)
         if response.status_code != 200:
             raise NextoryError(f'Nextory {label} returned HTTP {response.status_code}')
         try:
@@ -159,7 +165,9 @@ class NextoryBackend:
 
     def _ensure_login(self):
         with self._lock:
-            if time.monotonic() - self._authed_at < 20 * 60:
+            if self._access_blocked:
+                raise NextoryError('Nextory access paused after upstream rejection; operator review required')
+            if self._authed_at:
                 return
             username, password = self._credentials()
             self._api.headers.clear()
@@ -197,24 +205,10 @@ class NextoryBackend:
                 raise NextoryError(f'Network error during Nextory login ({type(exc).__name__})') from exc
 
     def _authenticated_get_json(self, url: str, label: str) -> dict:
-        """NEXTORY_AUTH_RETRY: on HTTP 401 refresh profile auth exactly once.
-
-        Caller holds the backend RLock so no concurrent request can replace
-        the shared requests.Session credentials while we retry.
-        """
+        """Use the current session; never automatically reclaim a rejected session."""
         self._ensure_login()
         try:
             response = self._api.get(url, timeout=(8, 18), allow_redirects=False)
-            if response.status_code == 401:
-                response.close()
-                logging.getLogger('uvicorn.error').warning(
-                    'NEXTORY_AUTH_RETRY endpoint=%s initial_status=401', label)
-                self._authed_at = 0.0
-                self._api.cookies.clear()
-                self._ensure_login()
-                response = self._api.get(url, timeout=(8, 18), allow_redirects=False)
-                logging.getLogger('uvicorn.error').info(
-                    'NEXTORY_AUTH_RETRY endpoint=%s final_status=%d', label, response.status_code)
             return self._checked_json(response, label)
         except requests.RequestException as exc:
             raise NextoryError(
@@ -469,6 +463,8 @@ class NextoryBackend:
             worker_api = getattr(self._duration_worker, 'api', None)
             worker_public = getattr(self._duration_worker, 'public', None)
             if host == 'api.nextory.com':
+                if self._access_blocked:
+                    raise NextoryError('Nextory access paused after upstream rejection')
                 if worker_api is None:
                     self._ensure_login()
                 session = worker_api if worker_api is not None else self._api
@@ -479,6 +475,10 @@ class NextoryBackend:
                                        stream=True, allow_redirects=False)
             except requests.RequestException as exc:
                 raise NextoryError(f'Nextory HLS network error ({type(exc).__name__})') from exc
+            if host == 'api.nextory.com' and response.status_code in (401, 403, 429):
+                self._access_blocked = True
+                response.close()
+                raise NextoryError('Nextory asset access rejected; automatic access paused')
             if response.status_code in (301, 302, 303, 307, 308):
                 location = response.headers.get('Location')
                 response.close()
@@ -656,16 +656,6 @@ class NextoryBackend:
             try:
                 response = self._api.get(url, params=params,
                                          timeout=(8, 20), allow_redirects=False)
-                if response.status_code != 200:
-                    # The public web-client contract differs from the reader
-                    # login session. No user tokens are sent on this fallback.
-                    headers = {'X-Application-Id': '203', 'X-App-Version': '53.0',
-                               'X-Country-Code': str(self._api.headers.get('X-Country-Code', 'NL')),
-                               'X-Device-Id': str(uuid.uuid4()), 'X-Locale': 'nl_NL',
-                               'X-Model': 'web', 'Origin': 'https://nextory.com',
-                               'Referer': 'https://nextory.com/'}
-                    response = self._public.get(url, params=params, headers=headers,
-                                                timeout=(8, 20), allow_redirects=False)
                 result = self._checked_json(response, 'search')
             except requests.RequestException as exc:
                 raise NextoryError('Network error during Nextory search') from exc
