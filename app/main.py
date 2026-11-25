@@ -962,9 +962,7 @@ async def search(library_id: str, q: str = '', _: bool = Depends(authenticated))
         return {'book': [], 'authors': [], 'series': [], 'tags': []}
     if len(query) > 100:
         raise HTTPException(status_code=400, detail='Search is too long')
-    entries, _ = await lightweight_catalog()
-    entries = [p for p in entries if query.casefold() in
-               (' '.join((p.title, *p.authors, p.series_name or ''))).casefold()][:30]
+    entries = None
     if os.getenv('CATALOG_LIVE_SEARCH', '1') == '1':
         try:
             previews = await run_in_threadpool(search_dutch_catalog, query)
@@ -973,6 +971,10 @@ async def search(library_id: str, q: str = '', _: bool = Depends(authenticated))
                 entries = [CatalogPreview.from_dict(p) for p in previews]
         except (NextoryError, AttributeError) as exc:
             logging.warning('Nextory live search unavailable: %s', exc)
+    if entries is None:
+        entries, _ = await lightweight_catalog()
+        entries = [p for p in entries if query.casefold() in
+                   (' '.join((p.title, *p.authors, p.series_name or ''))).casefold()][:30]
     return {'book': [{'libraryItem': summary_item(preview),
                       'matchKey': 'title', 'matchText': preview.title}
                      for preview in entries],
