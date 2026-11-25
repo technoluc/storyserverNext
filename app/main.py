@@ -1025,8 +1025,6 @@ async def play(item_id: str, req: Request, _: bool = Depends(authenticated)):
 @app.api_route('/public/session/{session_id}/track/{track_index}', methods=['GET', 'HEAD'])
 @app.api_route('/public/session/{session_id}/track/{track_index}.m3u8', methods=['GET', 'HEAD'])
 async def public_track(session_id: str, track_index: int, req: Request):
-    if format_control.is_session(session_id):
-        return format_control.track(session_id, track_index, req)
     session = registry.get(session_id)
     if not session or not 1 <= track_index <= len(session.tracks):
         raise HTTPException(status_code=404, detail='Playback session or track unavailable')
@@ -1152,8 +1150,6 @@ async def hls_resource(session_id: str, resource_token: str, filename: str, req:
 
 @app.post('/api/session/{session_id}/sync')
 async def sync_session(session_id: str, req: Request, _: bool = Depends(authenticated)):
-    if format_control.is_session(session_id):
-        return format_control.sync(session_id)
     session = registry.get(session_id)
     if not session:
         raise HTTPException(status_code=404, detail='Playback session unavailable')
@@ -1178,8 +1174,6 @@ async def sync_session(session_id: str, req: Request, _: bool = Depends(authenti
 
 @app.post('/api/session/{session_id}/close')
 async def close_session(session_id: str, req: Request, _: bool = Depends(authenticated)):
-    if format_control.is_session(session_id):
-        return format_control.sync(session_id, close=True)
     session = registry.get(session_id)
     if session:
         try:
