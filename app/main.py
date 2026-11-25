@@ -22,6 +22,7 @@ import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 from uuid import NAMESPACE_URL, uuid5
 
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -260,6 +261,10 @@ def author_id(name: str) -> str:
     return str(uuid5(NAMESPACE_URL, 'nextory-author:' + name))
 
 
+def series_id(name: str) -> str:
+    return str(uuid5(NAMESPACE_URL, 'nextory-series:' + name))
+
+
 def strip_html(source: str) -> str:
     return html.unescape(re.sub(r'<[^>]+>', ' ', source)).strip()
 
@@ -281,8 +286,7 @@ def metadata_json(info: BookInfo, expanded: bool) -> dict:
         result.update({
             'authors': [{'id': author_id(a), 'name': a} for a in info.authors],
             'narrators': list(info.narrators),
-            'series': ([{'id': str(uuid5(NAMESPACE_URL, 'nextory-series:' + series)),
-                        'name': series, 'sequence': info.series_order}] if series else []),
+            'series': series_metadata(series, info.series_order),
             'descriptionPlain': strip_html(info.description),
         })
     return result
@@ -355,6 +359,7 @@ def summary_item(preview: CatalogPreview) -> dict:
             'subtitle': preview.subtitle, 'authorName': authors,
             'authorNameLF': authors, 'narratorName': ', '.join(preview.narrators),
             'seriesName': preview.series_name or '',
+            'series': series_metadata(preview.series_name, preview.series_order),
             'genres': list(preview.genres), 'publishedYear': year,
             'publishedDate': preview.published_date, 'publisher': preview.publisher,
             'description': preview.description, 'isbn': preview.isbn, 'asin': None,
@@ -510,14 +515,17 @@ async def book_and_layout(item_id: str) -> tuple[BookInfo, tuple[TrackPart, ...]
 def filter_data_previews(previews: list[CatalogPreview], total: int) -> dict:
     """Build library filters from local metadata, never from audio manifests."""
     authors = sorted({a for p in previews for a in p.authors})
+    narrators = sorted({n for p in previews for n in p.narrators})
+    series = sorted({p.series_name for p in previews if p.series_name})
     return {'authors': [{'id': author_id(a), 'name': a} for a in authors],
             'genres': sorted({g for p in previews for g in p.genres}),
-            'tags': [], 'series': [],
-            'narrators': sorted({n for p in previews for n in p.narrators}),
+            'tags': [], 'series': [{'id': series_id(name), 'name': name} for name in series],
+            'narrators': narrators,
             'languages': sorted({p.language for p in previews if p.language}),
             'publishers': sorted({p.publisher for p in previews if p.publisher}),
             'publishedDecades': [], 'bookCount': total,
-            'authorCount': len(authors), 'seriesCount': 0, 'podcastCount': 0,
+            'authorCount': len(authors), 'narratorCount': len(narrators),
+            'seriesCount': len(series), 'podcastCount': 0,
             'numIssues': 0, 'loadedAt': int(time.time() * 1000)}
 
 
@@ -527,6 +535,11 @@ def collection_json(shelf: str, books: list[dict], *, total: int = 0) -> dict:
             'name': COLLECTION_NAMES[shelf], 'description': None,
             'books': books, 'numBooks': total,
             'lastUpdate': STARTED_MS, 'createdAt': STARTED_MS}
+
+
+def indexed_collection(shelf: str) -> dict:
+    previews, count = catalog_index.select(shelf, 0, -1)
+    return collection_json(shelf, [summary_item(p) for p in previews], total=count)
 
 
 def preview_detail(preview: CatalogPreview) -> dict:
@@ -540,9 +553,6 @@ def preview_detail(preview: CatalogPreview) -> dict:
     meta = m['metadata']
     meta['authors'] = [{'id': author_id(a), 'name': a} for a in preview.authors]
     meta['narrators'] = list(preview.narrators)
-    meta['series'] = ([{'id': str(uuid5(NAMESPACE_URL, 'nextory-series:' + preview.series_name)),
-                       'name': preview.series_name, 'sequence': preview.series_order}]
-                      if preview.series_name else [])
     meta['descriptionPlain'] = strip_html(preview.description)
     m['chapters'] = []  # Precise boundaries come in the playback session.
     m['numChapters'] = 0
@@ -555,7 +565,7 @@ def preview_detail(preview: CatalogPreview) -> dict:
 
 async def lightweight_catalog():
     """Only the SQLite metadata index; no Nextory HLS layout measurement."""
-    return await run_in_threadpool(catalog_index.select, 'all', 0, 4000)
+    return await run_in_threadpool(catalog_index.select, 'all', 0, -1)
 
 
 def filter_data(books: list[tuple[BookInfo, tuple[TrackPart, ...]]]) -> dict:
@@ -800,9 +810,7 @@ async def collections(library_id: str, page: int = 0, limit: int = 20,
         raise HTTPException(status_code=400, detail='Invalid collection pagination')
     chosen = COLLECTION_SHELVES[page * limit:(page + 1) * limit]
     def load():
-        return [collection_json(shelf, [summary_item(p) for p in catalog_index.select(shelf, 0, 4)[0]],
-                                total=catalog_index.select(shelf, 0, 1)[1])
-                for shelf, _ in chosen]
+        return [indexed_collection(shelf) for shelf, _ in chosen]
     results = await run_in_threadpool(load)
     return {'results': results, 'total': len(COLLECTION_SHELVES),
             'page': page, 'limit': limit, 'minified': bool(minified), 'sortDesc': False}
@@ -811,9 +819,7 @@ async def collections(library_id: str, page: int = 0, limit: int = 20,
 @app.get('/api/collections')
 async def all_collections(_: bool = Depends(authenticated)):
     def load():
-        return [collection_json(shelf, [summary_item(p) for p in catalog_index.select(shelf, 0, 4)[0]],
-                                total=catalog_index.select(shelf, 0, 1)[1])
-                for shelf, _ in COLLECTION_SHELVES]
+        return [indexed_collection(shelf) for shelf, _ in COLLECTION_SHELVES]
     return {'collections': await run_in_threadpool(load)}
 
 
@@ -832,31 +838,125 @@ async def collection_detail(collection_id: str, page: int = 0, limit: int | None
     return result
 
 
-@app.get('/api/libraries/{library_id}/authors')
-async def authors(library_id: str, _: bool = Depends(authenticated)):
-    shelf = check_library(library_id)
-    summaries, _ = await lightweight_catalog()
-    by_id = {p.book_id: p.authors for p in summaries}
+def book_counts(previews, field):
     counts = {}
-    for names in by_id.values():
-        for name in names:
+    for preview in previews:
+        for name in set(getattr(preview, field)):
             counts[name] = counts.get(name, 0) + 1
-    return {'authors': [{'id': author_id(name), 'name': name, 'numBooks': count}
-                        for name, count in sorted(counts.items())]}
+    return counts
+
+
+def catalog_page(page: int, limit: int, sort: str, desc: bool, minified: bool):
+    if not 0 <= page <= 10000 or not 0 <= limit <= 200:
+        raise HTTPException(status_code=400, detail='Invalid catalog pagination')
+    return {'page': page, 'limit': limit, 'sortBy': sort, 'sortDesc': desc, 'minified': minified}
+
+
+@app.get('/api/libraries/{library_id}/authors')
+async def authors(library_id: str, page: int = 0, limit: int = 0, sort: str = 'name',
+                  desc: bool = False, minified: bool = False, _: bool = Depends(authenticated)):
+    check_library(library_id)
+    params = catalog_page(page, limit, sort, desc, minified)
+    summaries, _ = await lightweight_catalog()
+    counts = book_counts(summaries, 'authors')
+    names = sorted(counts, key=lambda name: (counts[name], name.casefold()) if sort == 'numBooks'
+                   else name.casefold(), reverse=desc)
+    chosen = names[page * limit:(page + 1) * limit] if limit else names
+    results = [{'id': author_id(name), 'name': name, 'numBooks': counts[name],
+                'libraryId': LIBRARY_ID, 'lastFirst': name} for name in chosen]
+    return {**params, 'results': results, 'total': len(names)} if limit else {'authors': results}
+
+
+@app.get('/api/libraries/{library_id}/narrators')
+async def narrators(library_id: str, _: bool = Depends(authenticated)):
+    check_library(library_id)
+    summaries, _ = await lightweight_catalog()
+    counts = book_counts(summaries, 'narrators')
+    return {'narrators': [{'id': quote(base64.b64encode(name.encode()).decode('ascii'), safe=''),
+                           'name': name, 'numBooks': counts[name]}
+                          for name in sorted(counts, key=str.casefold)]}
+
+
+def series_groups(previews):
+    groups = defaultdict(list)
+    for preview in previews:
+        if preview.series_name:
+            groups[preview.series_name].append(preview)
+    return groups
+
+
+def series_metadata(name, order):
+    if not name:
+        return []
+    return [{'id': series_id(name), 'name': name, 'sequence': str(order) if order is not None else None}]
+
+
+def series_json(name, group):
+    books = []
+    for preview in sorted(group, key=lambda p: (p.series_order is None, p.series_order or 0,
+                                                p.title.casefold())):
+        item = summary_item(preview)
+        sequence = str(preview.series_order) if preview.series_order is not None else None
+        item['sequence'] = sequence
+        books.append(item)
+    return {'id': series_id(name), 'name': name, 'libraryId': LIBRARY_ID,
+            'description': None, 'books': books, 'numBooks': len(books),
+            'addedAt': STARTED_MS, 'updatedAt': STARTED_MS,
+            'totalDuration': sum(p.duration or 0 for p in group)}
+
+
+@app.get('/api/libraries/{library_id}/series')
+async def library_series(library_id: str, page: int = 0, limit: int = 0, sort: str = 'name',
+                         desc: bool = False, minified: bool = False, _: bool = Depends(authenticated)):
+    check_library(library_id)
+    params = catalog_page(page, limit, sort, desc, minified)
+    summaries, _ = await lightweight_catalog()
+    groups = series_groups(summaries)
+    names = sorted(groups, key=lambda name: (len(groups[name]), name.casefold()) if sort == 'numBooks'
+                   else name.casefold(), reverse=desc)
+    chosen = names[page * limit:(page + 1) * limit] if limit else names
+    return {**params, 'total': len(names), 'results': [series_json(name, groups[name]) for name in chosen]}
+
+
+@app.get('/api/libraries/{library_id}/series/{identifier}')
+async def library_series_detail(library_id: str, identifier: str, _: bool = Depends(authenticated)):
+    check_library(library_id)
+    return await series_detail(identifier, _)
+
+
+@app.get('/api/series/{identifier}')
+async def series_detail(identifier: str, _: bool = Depends(authenticated)):
+    summaries, _ = await lightweight_catalog()
+    for name, group in series_groups(summaries).items():
+        if series_id(name) == identifier:
+            return series_json(name, group)
+    raise HTTPException(status_code=404, detail='Series not found')
+
+
+@app.get('/api/libraries/{library_id}/stats')
+async def library_stats(library_id: str, _: bool = Depends(authenticated)):
+    check_library(library_id)
+    previews, total = await lightweight_catalog()
+    data = filter_data_previews(previews, total)
+    author_counts = book_counts(previews, 'authors')
+    genre_counts = book_counts(previews, 'genres')
+    return {'totalItems': total, 'totalAuthors': data['authorCount'],
+            'totalNarrators': data['narratorCount'], 'totalSeries': data['seriesCount'],
+            'totalGenres': len(genre_counts), 'totalSize': 0,
+            'totalDuration': sum(p.duration or 0 for p in previews), 'numAudioTracks': total,
+            'authorsWithCount': [{'id': author_id(name), 'name': name, 'count': n}
+                                 for name, n in sorted(author_counts.items(), key=lambda row: -row[1])[:10]],
+            'genresWithCount': [{'genre': name, 'count': n} for name, n in genre_counts.items()],
+            'largestItems': [], 'longestItems': []}
 
 
 @app.get('/api/authors/{au_id}')
 async def author(au_id: str, _: bool = Depends(authenticated)):
     summaries, _ = await lightweight_catalog()
-    result = {p.book_id: summary_item(p) for p in summaries}
-    for item in result.values():
-        meta = item['media']['metadata']
-        names = [x.strip() for x in meta.get('authorName', '').split(',') if x.strip()]
-        if any(author_id(name) == au_id for name in names):
-            name = next(name for name in names if author_id(name) == au_id)
-            matching = [v for v in result.values() if name in
-                        [x.strip() for x in v['media']['metadata'].get('authorName', '').split(',')]]
-            return {'id': au_id, 'name': name, 'libraryItems': matching[:100]}
+    name = next((n for n in book_counts(summaries, 'authors') if author_id(n) == au_id), None)
+    if name:
+        matching = [summary_item(preview) for preview in summaries if name in preview.authors]
+        return {'id': au_id, 'name': name, 'numBooks': len(matching), 'libraryItems': matching[:100]}
     raise HTTPException(status_code=404, detail='Author not found')
 
 
