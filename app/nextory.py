@@ -116,6 +116,15 @@ class NextoryBackend:
         self._lock = threading.RLock()
         self._api = requests.Session()
         self._public = requests.Session()
+        # Separate anonymous web discovery from authenticated reader and media traffic.
+        self._discovery_public = requests.Session()
+        self._discovery_public.headers.update({
+            'X-Application-Id': '203', 'X-App-Version': '53.0',
+            'X-Country-Code': 'NL', 'X-Device-Id': str(uuid.uuid4()),
+            'X-Locale': 'nl_NL', 'X-Model': 'web',
+            'Origin': 'https://nextory.com', 'Referer': 'https://nextory.com/',
+        })
+        self._discovery_retry_at: dict[str, float] = {}
         self._authed_at = 0.0
         self._access_blocked = False
         self._duration_worker = threading.local()  # NEXTORY_LAYOUT_PARALLEL_V1
@@ -627,56 +636,69 @@ class NextoryBackend:
             'genres': list(_strings_of_named(info.get('genres'))),
         }
 
+    def _public_discovery_json(self, url: str, label: str, *, params=None,
+                               missing_ok: bool = False) -> dict | None:
+        """Use the existing anonymous web discovery contract; never log in as fallback.
+
+        The private reader session is intentionally not involved. A denial here
+        is independent of the account's access state.
+        """
+        with self._lock:
+            if time.monotonic() < self._discovery_retry_at.get(label, 0.0):
+                raise NextoryError(f'Public Nextory {label} temporarily paused')
+            try:
+                with self._discovery_public.get(url, params=params, timeout=(8, 18),
+                                                allow_redirects=False) as response:
+                    status = response.status_code
+                    if missing_ok and status in (404, 410):
+                        return None
+                    if status in (401, 403, 429):
+                        self._discovery_retry_at[label] = time.monotonic() + 3600
+                    if status != 200:
+                        raise NextoryError(f'Public Nextory {label} returned HTTP {status}')
+                    try:
+                        data = response.json()
+                    except ValueError as exc:
+                        raise NextoryError(f'Public Nextory {label} returned invalid JSON') from exc
+            except requests.RequestException as exc:
+                raise NextoryError(f'Public Nextory {label} network error') from exc
+            if not isinstance(data, dict):
+                raise NextoryError(f'Public Nextory {label} returned unexpected JSON')
+            return data
+
     def get_product_preview(self, book_id: int) -> dict | None:
-        """One authenticated Nextory product lookup, without fetching audio."""
+        """Anonymous metadata lookup, without opening a reader session."""
         if not isinstance(book_id, int) or not 10000 <= book_id <= 999999999999:
             raise NextoryError('Invalid product ID')
-        with self._lock:
-            self._ensure_login()
-            try:
-                response = self._api.get(
-                    f'https://api.nextory.com/discovery/v1/product/{book_id}',
-                    timeout=(8, 18), allow_redirects=False)
-                if response.status_code in (404, 410):
-                    response.close()
-                    return None
-                data = self._checked_json(response, 'product preview')
-            except requests.RequestException as exc:
-                raise NextoryError('Network error fetching product preview') from exc
-            if str(data.get('id')) != str(book_id):
-                raise NextoryError('Product preview ID mismatch')
-            return self._preview_from_product(data)
+        data = self._public_discovery_json(
+            f'https://api.nextory.com/discovery/v1/product/{book_id}',
+            'product preview', missing_ok=True)
+        if data is None:
+            return None
+        if str(data.get('id')) != str(book_id):
+            raise NextoryError('Product preview ID mismatch')
+        return self._preview_from_product(data)
 
     def search_catalog(self, phrase: str, page: int = 0, per: int = 20) -> list[dict]:
-        """Nextory discovery API (unofficial), format=audiobook, paginated.
-
-        Public adapter evidence: Vito0912/abs-agg, src/providers/nextory/index.ts.
-        Never falls back to book-ID enumeration or bulk audio downloads.
-        """
+        """Live discovery using the anonymous web contract already used by this project."""
         if (not isinstance(phrase, str) or len(phrase) > 100 or
                 page < 0 or page > 10000 or per < 1 or per > 50):
             raise NextoryError('Invalid Nextory search parameters')
         params = {'search_phrase': phrase, 'page': page, 'per': per,
                   'format': 'audiobook', 'sort': 'relevance'}
-        with self._lock:
-            self._ensure_login()
-            url = 'https://api.nextory.com/discovery/v1/search/products/books'
-            try:
-                response = self._api.get(url, params=params,
-                                         timeout=(8, 20), allow_redirects=False)
-                result = self._checked_json(response, 'search')
-            except requests.RequestException as exc:
-                raise NextoryError('Network error during Nextory search') from exc
-            if not isinstance(result.get('products'), list):
-                raise NextoryError('Nextory search response missing products')
-            products = []
-            for entry in result['products'][:per]:
-                if not isinstance(entry, dict) or entry.get('media_type', 'book') != 'book':
-                    continue
-                mapped = self._preview_from_product(entry)
-                if mapped:
-                    products.append(mapped)
-            return products
+        result = self._public_discovery_json(
+            'https://api.nextory.com/discovery/v1/search/products/books',
+            'search', params=params)
+        if not isinstance(result.get('products'), list):
+            raise NextoryError('Nextory search response missing products')
+        products = []
+        for entry in result['products'][:per]:
+            if not isinstance(entry, dict) or entry.get('media_type', 'book') != 'book':
+                continue
+            mapped = self._preview_from_product(entry)
+            if mapped:
+                products.append(mapped)
+        return products
 
     def get_cover_jpeg(self, book_id: int, cover_url_hint: str | None = None) -> bytes:
         with self._lock:
