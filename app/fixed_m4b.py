@@ -34,6 +34,7 @@ PACKETS_PER_CHUNK = 64
 CHUNK_SAMPLES = PACKETS_PER_CHUNK * SAMPLES_PER_PACKET
 CHUNK_BYTES = PACKETS_PER_CHUNK * PACKET_BYTES
 CACHE_BYTES = 8 * 1024 * 1024
+SHARED_CACHE_BYTES = 2 * CACHE_BYTES
 # At most one FFmpeg worker, including encoding; do not exceed container budget.
 _WORKERS = asyncio.Semaphore(1)
 MAX_DURATION = 40 * 3600
@@ -46,6 +47,55 @@ MARKER = 'NEXTORY_FIXED_M4B_V1'
 
 class MediaError(RuntimeError):
     pass
+
+
+class ChunkCache:
+    """LRU for generated audio, bounded across all playback sessions."""
+
+    def __init__(self, budget: int):
+        self.budget = budget
+        self.size = 0
+        self.entries: OrderedDict[tuple[str, int], bytes] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def _remove(self, key: tuple[str, int]) -> None:
+        self.size -= len(self.entries.pop(key))
+
+    def get(self, session: str, index: int) -> bytes | None:
+        key = (session, index)
+        with self._lock:
+            data = self.entries.get(key)
+            if data is not None:
+                self.entries.move_to_end(key)
+            return data
+
+    def put(self, session: str, index: int, data: bytes, session_budget: int) -> None:
+        if len(data) > min(self.budget, session_budget):
+            return
+        key = (session, index)
+        with self._lock:
+            if key in self.entries:
+                self._remove(key)
+            session_keys = [k for k in self.entries if k[0] == session]
+            session_size = sum(len(self.entries[k]) for k in session_keys)
+            for old in session_keys:
+                if session_size + len(data) <= session_budget:
+                    break
+                session_size -= len(self.entries[old])
+                self._remove(old)
+            while self.size + len(data) > self.budget:
+                self._remove(next(iter(self.entries)))
+            self.entries[key] = data
+            self.size += len(data)
+
+    def discard_session(self, session: str) -> None:
+        with self._lock:
+            for key in list(self.entries):
+                if key[0] == session:
+                    self._remove(key)
+
+
+_CHUNKS = ChunkCache(SHARED_CACHE_BYTES)
 
 
 def enabled(book_id: int, *, allow_all: bool = True) -> bool:
@@ -252,7 +302,7 @@ class FixedM4B(VirtualRange):
         self.chunk_count=(self.packet_count+PACKETS_PER_CHUNK-1)//PACKETS_PER_CHUNK
         if rate<=0 or not 0<=cache_bytes<=CACHE_BYTES: raise MediaError('invalid_cache_limits')
         self.rate=rate; self.cache_limit=cache_bytes
-        self.cache=OrderedDict(); self.cache_size=0; self.hashes={}
+        self.hashes={}
         self._guard=asyncio.Lock(); self._lock=threading.Lock(); self._active=0
         self.closed=False; self.generated=0; self.requests=0
         # Strong validator is session-specific. Cache regeneration is checked
@@ -260,16 +310,19 @@ class FixedM4B(VirtualRange):
         self.etag='"'+hashlib.sha256(os.urandom(32)+self.header).hexdigest()+'"'
 
     def close(self):
-        self.closed=True; self.cache.clear(); self.cache_size=0; self.hashes.clear()
+        with self._lock:
+            self.closed=True
+            _CHUNKS.discard_session(self.etag)
+            self.hashes.clear()
 
     async def chunk(self,i):
         if self.closed or not 0<=i<self.chunk_count:
             raise MediaError('invalid_chunk')
         async with self._guard:
             if self.closed: raise MediaError('session_closed')
-            if i in self.cache:
-                self.cache.move_to_end(i)
-                return self.cache[i]
+            cached = _CHUNKS.get(self.etag, i)
+            if cached is not None:
+                return cached
             start=i*CHUNK_SAMPLES; end=min(start+CHUNK_SAMPLES,self.total_samples)
             actual_end=min(end,self.source_samples)
             started=time.monotonic(); pieces=[]; pos=start
@@ -284,19 +337,17 @@ class FixedM4B(VirtualRange):
                 # samples (0.171 seconds) so all packet lengths are identical.
                 if end>actual_end: pieces.append(bytes((end-actual_end)*2))
                 result=await encode_pcm(b''.join(pieces))
-            if self.closed: raise MediaError('session_closed')
             expected=(end-start)//SAMPLES_PER_PACKET*PACKET_BYTES
             if len(result)!=expected: raise MediaError('wrong_chunk_length')
             digest=hashlib.sha256(result).digest()
-            if i in self.hashes and self.hashes[i]!=digest:
-                raise MediaError('source_changed_within_session')
-            self.hashes[i]=digest; self.generated+=1
-            if len(result)<=self.cache_limit:
-                while self.cache and self.cache_size+len(result)>self.cache_limit:
-                    _,old=self.cache.popitem(last=False); self.cache_size-=len(old)
-                self.cache[i]=result; self.cache_size+=len(result)
-            LOG.info('POC_FIXED_M4B event=chunk index=%d start_seconds=%.3f packets=%d bytes=%d elapsed_ms=%d generated=%d unique=%d cache_bytes=%d',
-                i,start/RATE,len(result)//PACKET_BYTES,len(result),round((time.monotonic()-started)*1000),self.generated,len(self.hashes),self.cache_size)
+            with self._lock:
+                if self.closed: raise MediaError('session_closed')
+                if i in self.hashes and self.hashes[i]!=digest:
+                    raise MediaError('source_changed_within_session')
+                self.hashes[i]=digest; self.generated+=1
+                _CHUNKS.put(self.etag, i, result, self.cache_limit)
+            LOG.info('POC_FIXED_M4B event=chunk index=%d start_seconds=%.3f packets=%d bytes=%d elapsed_ms=%d generated=%d unique=%d shared_cache_bytes=%d',
+                i,start/RATE,len(result)//PACKET_BYTES,len(result),round((time.monotonic()-started)*1000),self.generated,len(self.hashes),_CHUNKS.size)
             return result
 
     async def piece(self,pos,end):

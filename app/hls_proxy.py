@@ -22,10 +22,6 @@ MAX_SESSIONS = 30
 URI_ATTR_RE = re.compile(r'URI="([^"]+)"')
 
 
-class FixedSessionCapacity(NextoryError):
-    pass
-
-
 @dataclass(frozen=True)
 class Resource:
     url: str
@@ -51,7 +47,6 @@ class Playback:
     book_playlist: bytes | None = None  # NEXTORY_SINGLE_PRESENTATION_V1
     book_playlist_segments: int = 0
     fixed_m4b: object | None = None  # NEXTORY_FIXED_M4B_V1
-    fixed_reservation: bool = False
     _lock: threading.RLock = field(default_factory=threading.RLock)
 
     def register(self, url: str, kind: str) -> str:
@@ -109,7 +104,6 @@ class Playback:
             if self.fixed_m4b is not None:
                 self.fixed_m4b.close()
                 self.fixed_m4b = None
-            self.fixed_reservation = False
 
 
 class Registry:
@@ -119,15 +113,13 @@ class Registry:
 
     def create(self, *, book_id: int, title: str, tracks: tuple[TrackPart, ...],
                user_id: str, current_time: float = 0.0,
-               book_presentation: bool = False, fixed_presentation: bool = False) -> Playback:
+               book_presentation: bool = False) -> Playback:
         if not tracks or len(tracks) > 256:
             raise NextoryError('Invalid whole-book track list')
         with self._lock:
             self.cleanup()
             if len(self._sessions) >= MAX_SESSIONS:
                 raise NextoryError('Too many playback sessions')
-            if fixed_presentation and sum(s.fixed_reservation for s in self._sessions.values()) >= 2:
-                raise FixedSessionCapacity('Virtual M4B session capacity reached')
             if book_presentation and sum(s.book_playlist is not None for s in self._sessions.values()) >= 4:
                 raise NextoryError('Single presentation capacity reached')
             duration = round(tracks[-1].start + tracks[-1].duration, 3)
@@ -136,8 +128,7 @@ class Registry:
                                book_id=book_id, title=title, duration=duration,
                                tracks=tracks, user_id=user_id,
                                current_time=max(0.0, min(current_time, duration)),
-                               book_playlist=b"" if book_presentation else None,
-                               fixed_reservation=fixed_presentation)
+                               book_playlist=b"" if book_presentation else None)
             for track in tracks:
                 session.root_tokens[track.index] = session.register(track.uri, 'manifest')
             self._sessions[session.id] = session

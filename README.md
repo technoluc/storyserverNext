@@ -26,7 +26,7 @@ De server haalt bij het starten automatisch luisterboekmetadata op bij Nextory e
 
 ## Afspelen in AudioBooth
 
-AudioBooth krijgt standaard een virtuele M4B voor ieder boek. De server maakt de audio op aanvraag met FFmpeg. Als de M4B-sessie niet kan worden voorbereid, bijvoorbeeld omdat beide M4B-sessieplaatsen bezet zijn, gebruikt de server de bestaande HLS-route. Andere clients blijven HLS gebruiken.
+AudioBooth krijgt standaard een virtuele M4B voor ieder boek. De server maakt de audio op aanvraag met één FFmpeg-worker en deelt maximaal 16 MiB aan audiocache tussen alle sessies, met maximaal 8 MiB per sessie. Bij ruimtegebrek verdwijnen de minst recent gebruikte audioblokken uit de cache. Een nog geldige sessie kan ze opnieuw genereren. Als een boek niet als M4B kan worden voorbereid, gebruikt de server de bestaande HLS-route. Andere clients blijven HLS gebruiken.
 
 Heb je eerder `NEXTORY_TEST_VIRTUAL_M4B_BOOK` in je `.env` gezet, verwijder dan die regel of zet de waarde op `all` om alle boeken te gebruiken.
 

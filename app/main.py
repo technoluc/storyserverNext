@@ -29,7 +29,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from .hls_proxy import FixedSessionCapacity, registry, rewrite_playlist
+from .hls_proxy import registry, rewrite_playlist
 from .nextory import BookInfo, CONFIG_PATH, NextoryError, TrackPart, nextory
 from .prewarm import PrewarmManager  # NEXTORY_DETAIL_PREWARM_V1
 from .hls_delivery import build_resource_response  # HLS_FIRSTPLAY_SERVER_V1
@@ -936,11 +936,10 @@ async def play(item_id: str, req: Request, _: bool = Depends(authenticated)):
             # The internal source tracks are retained. AudioBooth sees only
             # one classic M4B track, using the same existing playback session.
             session = registry.create(book_id=info.book_id, title=info.title,
-                                      tracks=tracks, user_id=USER_ID, current_time=start_time,
-                                      fixed_presentation=True)
+                                      tracks=tracks, user_id=USER_ID, current_time=start_time)
             engine = fixed_m4b.FixedM4B(tracks, fixed_m4b.LocalPlaybackSource(session))
             session.fixed_m4b = engine
-        except (fixed_m4b.MediaError, FixedSessionCapacity) as exc:
+        except fixed_m4b.MediaError as exc:
             if session is not None:
                 registry.close(session.id)
             session = None
