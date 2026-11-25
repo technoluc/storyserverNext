@@ -76,4 +76,3 @@ This restores v5 application code and rebuilds only the test container. No crede
 ## Test evidence
 
 Local Python unit/API tests use deterministic Nextory metadata and HTTP fixtures. Tests cover login, 34-part audio sessions, 20 collections in one library, cached item details, skipping provider requests in the initial track-entry route, session URL refresh after five minutes, HLS playlist rewrites and seek/progress persistence. There is no live Nextory or iPhone network in the build environment, and Docker rebuilds must be tested on the user's node.
-

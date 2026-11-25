@@ -1,0 +1,41 @@
+services:
+  nextory-abs-poc:
+    build: .
+    container_name: nextory-abs-poc
+    env_file:
+      - .env
+    environment:
+      - NEXTORY_CONFIG_PATH=/run/nextory/audiobook-dl.toml
+      - NEXTORY_BOOKS_FILE=/run/nextory-book-ids.txt
+      - PROGRESS_FILE=/state/progress.json
+    volumes:
+      - type: bind
+        source: ${NEXTORY_CONFIG_SOURCE:?Run sh configure-nextory.sh first}
+        target: /run/nextory
+        read_only: true
+      - type: bind
+        source: ./book-ids.txt
+        target: /run/nextory-book-ids.txt
+        read_only: true
+      - type: volume
+        source: nextory-progress
+        target: /state
+    restart: unless-stopped
+    ports:
+      - "${BIND_IP:-127.0.0.1}:${PORT:-13378}:8000"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 100
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+volumes:
+  nextory-progress:

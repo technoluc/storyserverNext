@@ -1,0 +1,32 @@
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")"
+if [ ! -f .env ]; then
+    echo 'Run sh setup.sh first.'
+    exit 1
+fi
+# Use values from local file in the shell, never echo the password.
+set -a
+. ./.env
+set +a
+clear
+printf '=== 1. CONTAINER ===\n'
+docker compose ps
+printf '\n=== 2. HEALTH / STATUS ===\n'
+BASE="http://127.0.0.1:${PORT:-13378}"
+python3 - "$BASE" <<'PY'
+import json,sys,urllib.request
+base=sys.argv[1]
+for path in ('/health','/ping','/status'):
+    try:
+        with urllib.request.urlopen(base+path,timeout=5) as r:
+            data=json.load(r)
+            print(f'{path} HTTP={r.status} RESULT={"PASS" if r.status==200 else "FAIL"}')
+            if path=='/status':
+                print('SERVER_VERSION=',data.get('serverVersion'))
+    except Exception as e:
+        print(f'{path} RESULT=FAIL TYPE={type(e).__name__}')
+PY
+printf '\n=== 3. CONTAINER LOG (LAST 20) ===\n'
+docker compose logs --no-color --tail=20
+printf '\n=== END ===\n'

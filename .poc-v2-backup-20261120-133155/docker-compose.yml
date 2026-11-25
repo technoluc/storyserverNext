@@ -1,0 +1,23 @@
+services:
+  nextory-abs-poc:
+    build: .
+    container_name: nextory-abs-poc
+    env_file:
+      - .env
+    restart: unless-stopped
+    ports:
+      - "${BIND_IP:-127.0.0.1}:${PORT:-13378}:8000"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 100
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

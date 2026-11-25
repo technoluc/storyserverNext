@@ -1,0 +1,47 @@
+{
+  "parts": [
+    {
+      "name": "part-00.bin",
+      "size": 820,
+      "sha256": "2a00f10eedc0ebccebbfb87eeb9fe52df0fac1ff37db5d552317f8070cd87c6e"
+    },
+    {
+      "name": "part-01.bin",
+      "size": 49345,
+      "sha256": "9546aafc05b809bb8f3f35de4314e8c7714af35f80e0ec1a54f7ca8542de2cef"
+    },
+    {
+      "name": "part-02.bin",
+      "size": 49404,
+      "sha256": "4fd66075abf6a0e2776e3195ab94021f21de880b86588b097150a6e9a4705ee4"
+    },
+    {
+      "name": "part-03.bin",
+      "size": 49458,
+      "sha256": "cd952b6dc867abfb34171a482fdabcbc21e096138e1e6fc3ec22b3d57862243d"
+    },
+    {
+      "name": "part-04.bin",
+      "size": 49469,
+      "sha256": "22c3a7589677761187c1d8d3e93797fd6fdaa4afefb591fef876e2b320351518"
+    },
+    {
+      "name": "part-05.bin",
+      "size": 49475,
+      "sha256": "1a6ed9a8ed7f8305269be1a52115c79087535e2be8ccea9219c7cb5060946d56"
+    },
+    {
+      "name": "part-06.bin",
+      "size": 49984,
+      "sha256": "1b48238f817a6209220a891f9b2fb51e9a9ef0f62589a0d30285a2a7db147dd2"
+    },
+    {
+      "name": "part-07.bin",
+      "size": 162,
+      "sha256": "465f0091b166b2a3e2f614f8e7a0a132782cdc5b5b58fbaac9e1c1ca7643e814"
+    }
+  ],
+  "length": 298117,
+  "duration": 36.02322,
+  "sha256": "60dda86e4ec5f8853eb57ebb39b45d4a072eb4c7502e8e6339e8ca532166b082"
+}
