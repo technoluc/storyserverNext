@@ -9,6 +9,7 @@ No media packages, signed HLS URLs, keys, or login details are stored here.
 from __future__ import annotations
 
 import html
+import hashlib
 import json
 import os
 import re
@@ -58,6 +59,10 @@ BOOK_HREF = re.compile(r'^/nl/book/[a-zA-Z0-9%\-]+-(\d{5,12})/?$')
 COLLECTION_INITIAL_TARGET = 120
 COLLECTION_GROWTH = 36
 SOURCE_PAGES_PER_REQUEST = 6
+CATEGORY_STALL_LIMIT = 3
+CATEGORY_MAX_SOURCE_PAGES = 100
+CATEGORY_FAILURE_COOLDOWN = 3600
+PREVIEW_MISS_TTL = 7 * 86400
 
 
 def is_dutch(language: str | None) -> bool:
@@ -187,6 +192,8 @@ class CatalogIndex:
                 shelf TEXT NOT NULL, page INTEGER NOT NULL, scanned_at REAL NOT NULL,
                 PRIMARY KEY(shelf, page))''')
             con.execute('CREATE TABLE IF NOT EXISTS stats (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+            con.execute('CREATE TABLE IF NOT EXISTS preview_misses (book_id INTEGER PRIMARY KEY, checked_at REAL NOT NULL)')
+            con.execute('CREATE TABLE IF NOT EXISTS category_pages (shelf TEXT NOT NULL, fingerprint TEXT NOT NULL, PRIMARY KEY(shelf,fingerprint))')
 
     def upsert(self, products: list[dict], shelf: str | None = None,
                page: int = 0, replace: bool = False) -> int:
@@ -282,7 +289,7 @@ class CatalogIndex:
         if not shelf.startswith('category:'):
             return False
         with self._lock, self._connect() as con:
-            exhausted = con.execute('SELECT 1 FROM stats WHERE key=?', ('end:' + shelf,)).fetchone()
+            exhausted = con.execute('SELECT 1 FROM stats WHERE key IN (?,?)', ('end:' + shelf, 'pause:' + shelf)).fetchone()
         return not bool(exhausted)
 
     def last_scan(self, shelf: str, page: int = 0) -> float:
@@ -297,9 +304,10 @@ class CatalogIndex:
                                  JOIN dutch_books b ON b.id=s.book_id WHERE s.shelf='recent'""").fetchone()[0]
             scans = con.execute('SELECT shelf,page,scanned_at FROM scans ORDER BY scanned_at DESC LIMIT 8').fetchall()
             row = con.execute("SELECT value FROM stats WHERE key='error'").fetchone()
+            paused = con.execute("SELECT key,value FROM stats WHERE key LIKE 'pause:category:%'").fetchall()
         return {'indexedAudiobooks': count, 'recentlyDiscovered': recent,
                 'lastScans': [dict(r) for r in scans], 'lastError': row[0] if row else None,
-                'refreshSeconds': REFRESH_SECONDS}
+                'refreshSeconds': REFRESH_SECONDS, 'pausedCategories': {r[0].removeprefix('pause:category:'): r[1] for r in paused}}
 
     def _set_error(self, message: str):
         # Never persist Nextory tokens, credentials, or raw upstream responses.
@@ -324,21 +332,27 @@ class CatalogIndex:
 
     def _hydrate(self, ids: list[int], max_new: int = 40) -> list[dict]:
         previews = []
-        for n in ids:
+        for n in dict.fromkeys(ids):
             cached = self.lookup(n, dutch_only=False)
             if cached:
                 if is_dutch(cached.language):
                     previews.append(cached.as_dict())
                 continue
-            if max_new <= 0:
+            with self._lock, self._connect() as con:
+                miss = con.execute('SELECT checked_at FROM preview_misses WHERE book_id=?', (n,)).fetchone()
+            if miss and miss[0] > time.time() - PREVIEW_MISS_TTL:
                 continue
+            if max_new <= 0:
+                break
             max_new -= 1
-            try:
-                preview = nextory.get_product_preview(n)
-                if preview and is_dutch(preview.get('language')):
-                    previews.append(preview)
-            except NextoryError:
-                continue  # Public page might include ebook-only, unreleased or region-restricted titles.
+            # Fail the page on transient or authorization errors; never retry every ID.
+            preview = nextory.get_product_preview(n)
+            if preview and is_dutch(preview.get('language')):
+                previews.append(preview)
+                self.upsert([preview])
+            else:
+                with self._lock, self._connect() as con:
+                    con.execute('INSERT OR REPLACE INTO preview_misses VALUES(?,?)', (n, time.time()))
             time.sleep(0.12)  # Bounded politeness for upstream metadata calls.
         return previews
 
@@ -384,7 +398,16 @@ class CatalogIndex:
         if not lock.acquire(blocking=False):
             return None
         try:
-            return self._scan_category(key, target=None, page_budget=1)
+            with self._lock, self._connect() as con:
+                retry = con.execute('SELECT value FROM stats WHERE key=?', ('retry:category:' + key,)).fetchone()
+            if retry and float(retry[0]) > time.time():
+                return None
+            try:
+                return self._scan_category(key, target=None, page_budget=1)
+            except (NextoryError, OSError, ValueError, sqlite3.Error):
+                with self._lock, self._connect() as con:
+                    con.execute('INSERT OR REPLACE INTO stats VALUES(?,?)', ('retry:category:' + key, str(time.time() + CATEGORY_FAILURE_COOLDOWN)))
+                raise
         finally:
             lock.release()
 
@@ -399,7 +422,13 @@ class CatalogIndex:
             first = db.execute('SELECT COALESCE(MAX(page), 0) + 1 FROM scans WHERE shelf=?',
                                (shelf,)).fetchone()[0]
         last_saved = None
-        for source_page in range(first, min(first + page_budget, 10001)):
+        def pause(reason: str):
+            with self._lock, self._connect() as con:
+                con.execute('INSERT OR REPLACE INTO stats VALUES(?,?)', ('pause:' + shelf, reason))
+        if first > CATEGORY_MAX_SOURCE_PAGES:
+            pause('source-page-limit')
+            return None
+        for source_page in range(first, min(first + page_budget, CATEGORY_MAX_SOURCE_PAGES + 1)):
             uri = 'https://nextory.com' + CATEGORY_PATHS[key]
             if source_page > 1:
                 uri += '?page=' + str(source_page)
@@ -416,10 +445,25 @@ class CatalogIndex:
                     con.execute('INSERT OR REPLACE INTO stats(key,value) VALUES(?,?)',
                                 ('end:' + shelf, str(source_page)))
                 return last_saved
-            products = self._hydrate(ids, max_new=100)
+            fingerprint = hashlib.sha256(','.join(map(str, sorted(set(ids)))).encode()).hexdigest()
+            with self._lock, self._connect() as con:
+                repeated = con.execute('SELECT 1 FROM category_pages WHERE shelf=? AND fingerprint=?', (shelf, fingerprint)).fetchone()
+                row = con.execute('SELECT value FROM stats WHERE key=?', ('stall:' + shelf,)).fetchone()
+            if repeated:
+                pause('repeated-source-page')
+                return last_saved
+            before = self.select(shelf, 0, 1)[1]
+            products = self._hydrate(ids, max_new=len(set(ids)))
             self.upsert(products, shelf, source_page, replace=True)
             count = self.select(shelf, 0, 1)[1]
+            stall = (int(row[0]) if row else 0) + 1 if count <= before else 0
+            with self._lock, self._connect() as con:
+                con.execute('INSERT OR IGNORE INTO category_pages VALUES(?,?)', (shelf, fingerprint))
+                con.execute('INSERT OR REPLACE INTO stats VALUES(?,?)', ('stall:' + shelf, str(stall)))
             last_saved = (source_page, count)
+            if stall >= CATEGORY_STALL_LIMIT:
+                pause('no-new-category-books')
+                return last_saved
             if target is not None and count >= target:
                 break
         return last_saved
