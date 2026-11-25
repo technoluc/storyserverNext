@@ -22,7 +22,19 @@ Met `docker compose ps` zie je of de server gezond is. Met `docker compose logs 
 
 ## Catalogus
 
-De server vult genrecollecties op de achtergrond, één Nextory-pagina per genre per ronde. Hij wacht 15 seconden na een opgehaalde pagina voordat hij doorgaat. De collectie toont wat er al beschikbaar is. Na een herstart gaat de server verder vanaf de opgeslagen pagina. Zoeken gebruikt Nextory live. Boeken met een andere of onbekende taal blijven buiten de catalogus. In de containerlogs toont `POC_CATALOG` de verwerkte pagina en het aantal Nederlandse luisterboeken per genre.
+De bestaande SQLite-catalogus blijft behouden. Standaard leest bladeren en zoeken uitsluitend uit die catalogus, start de server geen automatische Nextory-synchronisatie en opent een boekdetail geen afspeelsessie op voorhand. Covers gebruiken alleen de opgeslagen cover-URL zonder accountauthenticatie.
+
+| Optie in .env | Standaard | Betekenis |
+|---|---|---|
+| `CATALOG_AUTOSYNC` | `0` | Achtergrondsynchronisatie uit; alleen na expliciete keuze inschakelen. |
+| `CATALOG_LIVE_SEARCH` | `0` | Zoeken in de lokale catalogus. |
+| `NEXTORY_DETAIL_PREWARM` | `0` | Geen voorbereidende audioverzoeken bij boekdetails. |
+
+Een nieuwe installatie met een lege catalogus heeft aanvankelijk geen boeken. De optionele handmatige recente-refresh via `POST /api/poc/discovery-refresh` en de optionele synchronisatie kunnen accountactiviteit veroorzaken; gebruik deze alleen als het abonnement en gelijktijdig gebruik dat toelaten. De scan pauzeert categorieën na herhaalde bronpagina's, drie pagina's zonder groei of maximaal 100 bronpagina's. Bij een fout wacht een categorie minstens een uur; niet-geschikte previews worden zeven dagen onthouden. Pauzeredenen staan in `/api/poc/catalog-status`.
+
+De backend logt niet meer iedere twintig minuten opnieuw in. Bij HTTP 401, 403 of 429 wordt verdere geauthenticeerde toegang in het proces geblokkeerd, zonder automatisch opnieuw inloggen. Controleer het account en eventuele gelijktijdige-gebruiksbeperkingen voordat je de server bewust opnieuw start. Een eerste login of daadwerkelijke afspeelactie kan nog steeds een andere gebruiker verdringen als Nextory dat zo afdwingt. Gebruik alleen een door het abonnement toegestane sessie en laat de server uit als dat niet kan.
+
+Offline regressietests: `python -m unittest discover -s tests -p test_session_safety.py`.
 
 ## Afspelen in AudioBooth
 
