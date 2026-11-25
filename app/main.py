@@ -407,11 +407,13 @@ def _collection_listing(shelf: str, page: int, limit: int | None):
 async def _discovery_poller():
     # API work happens in a thread, never on the ASGI event loop.
     while True:
+        if nextory.access_paused:
+            return
         try:
             await run_in_threadpool(catalog_index.refresh_recent)
         except (NextoryError, OSError, ValueError) as exc:
             logging.warning('Nextory catalog refresh failed (preserving last index): %s', exc)
-            await asyncio.sleep(60)
+            await asyncio.sleep(3600)
         else:
             await asyncio.sleep(REFRESH_SECONDS)
 
@@ -421,6 +423,8 @@ async def _collection_poller():
     while True:
         filled = False
         for key, _, _ in CATEGORIES:
+            if nextory.access_paused:
+                return
             try:
                 result = await run_in_threadpool(catalog_index.fill_next_category_page, key)
             except (NextoryError, OSError, ValueError, sqlite3.Error) as exc:
@@ -432,7 +436,7 @@ async def _collection_poller():
                 logger.info('POC_CATALOG category=%s source_page=%d indexed=%d', key, *result)
                 await asyncio.sleep(15)
         if not filled:
-            await asyncio.sleep(60)
+            await asyncio.sleep(3600)
 
 
 @app.on_event('startup')
@@ -986,6 +990,7 @@ async def discovery_status(_: bool = Depends(authenticated)):
             'categories': [code for code, _, _ in CATEGORIES],
             'automaticRefresh': os.getenv('CATALOG_AUTOSYNC', '0') == '1',
             'automaticCollectionFill': os.getenv('CATALOG_AUTOSYNC', '0') == '1',
+            'upstreamAccessPaused': nextory.access_paused,
             **(await run_in_threadpool(catalog_index.statistics))}
 
 
