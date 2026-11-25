@@ -49,6 +49,34 @@ class MediaError(RuntimeError):
     pass
 
 
+class FFmpegError(MediaError):
+    def __init__(self, reason: str, returncode: int | None, stderr_bytes: int):
+        super().__init__(reason)
+        self.returncode = returncode
+        self.stderr_bytes = stderr_bytes
+
+
+class ShortSourcePCM(MediaError):
+    def __init__(self, received_samples: int):
+        super().__init__('short_source_pcm')
+        self.received_samples = received_samples
+
+
+def log_chunk_error(exc, *, phase, chunk, part=None, offset=None, requested=None):
+    # Report only predefined error codes and numeric context. FFmpeg can print
+    # playback URLs and signed query strings in stderr and in its arguments.
+    reason = str(exc) if isinstance(exc, MediaError) else type(exc).__name__
+    LOG.warning(
+        'POC_FIXED_M4B event=ffmpeg_error phase=%s reason=%s chunk=%d part=%s '
+        'source_offset_seconds=%s requested_samples=%s received_samples=%s '
+        'returncode=%s stderr_bytes=%s',
+        phase, reason, chunk, part if part is not None else '-',
+        f'{offset / RATE:.3f}' if offset is not None else '-',
+        requested if requested is not None else '-', getattr(exc, 'received_samples', '-'),
+        getattr(exc, 'returncode', '-'), getattr(exc, 'stderr_bytes', '-'),
+    )
+
+
 class ChunkCache:
     """LRU for generated audio, bounded across all playback sessions."""
 
@@ -190,15 +218,23 @@ async def ffmpeg(args, data=None, timeout=FFMPEG_TIMEOUT):
         raise
     diagnostic=err.lower()
     if b'could not seek' in diagnostic or b'seek failed' in diagnostic or b'error seeking' in diagnostic:
-        raise MediaError('source_seek_failed')
+        raise FFmpegError('source_seek_failed', p.returncode, len(err))
     if p.returncode:
         reason=next((label for needle,label in (
             (b'403 forbidden','source_forbidden'), (b'401 unauthorized','source_unauthorized'),
             (b'404 not found','source_missing'), (b'not on whitelist','protocol_refused'),
             (b'invalid data','invalid_media'), (b'could not find codec','codec_unavailable'),
-            (b'connection refused','source_unavailable'), (b'timed out','source_timeout'))
+            (b'connection refused','source_unavailable'), (b'timed out','source_timeout'),
+            (b'error when loading first segment','segment_load_failed'),
+            (b'failed to open segment','segment_open_failed'),
+            (b'unable to open key file','hls_key_unavailable'),
+            (b'error while decoding','decode_failed'),
+            (b'error initializing output stream','output_init_failed'),
+            (b'error while opening encoder','encoder_open_failed'),
+            (b'end of file','unexpected_eof'), (b'input/output error','io_error'),
+            (b'resource temporarily unavailable','resource_unavailable'))
             if needle in diagnostic),'ffmpeg_failed')
-        raise MediaError(reason)
+        raise FFmpegError(reason, p.returncode, len(err))
     return out
 
 
@@ -283,7 +319,7 @@ class LocalPlaybackSource:
             # Never hide a missing chapter or mid-book failure with silence.
             missing=count*2-len(pcm)
             if start+count!=part.end or missing>int(RATE*.05)*2 or not pcm:
-                raise MediaError('short_source_pcm')
+                raise ShortSourcePCM(len(pcm)//2)
             LOG.info('POC_FIXED_M4B event=chapter_end_rounding samples=%d',missing//2)
             pcm+=bytes(missing)
         return pcm[:count*2]
@@ -330,13 +366,22 @@ class FixedM4B(VirtualRange):
                 while pos<actual_end:
                     part=self.parts[bisect.bisect_right(self.ends,pos)]
                     stop=min(actual_end,part.end)
-                    data=await self.source.read(part,pos,stop-pos)
+                    try:
+                        data=await self.source.read(part,pos,stop-pos)
+                    except (MediaError, asyncio.TimeoutError, OSError) as exc:
+                        log_chunk_error(exc, phase='source_read', chunk=i, part=part.index,
+                                        offset=pos-part.start, requested=stop-pos)
+                        raise
                     if len(data)!=(stop-pos)*2: raise MediaError('wrong_pcm_length')
                     pieces.append(data); pos=stop
                 # A fractional final ALAC packet is padded by at most 4095
                 # samples (0.171 seconds) so all packet lengths are identical.
                 if end>actual_end: pieces.append(bytes((end-actual_end)*2))
-                result=await encode_pcm(b''.join(pieces))
+                try:
+                    result=await encode_pcm(b''.join(pieces))
+                except (MediaError, asyncio.TimeoutError, OSError) as exc:
+                    log_chunk_error(exc, phase='alac_encode', chunk=i, requested=end-start)
+                    raise
             expected=(end-start)//SAMPLES_PER_PACKET*PACKET_BYTES
             if len(result)!=expected: raise MediaError('wrong_chunk_length')
             digest=hashlib.sha256(result).digest()
