@@ -1,6 +1,6 @@
 """Standalone Audiobookshelf-compatible Nextory virtual-book server, version 6.
 
-Nextory catalogue discovery, live search, and pinned books are indexed. The iOS client requests separate
+Nextory catalogue discovery and live search are indexed. The iOS client requests separate
 original HLS parts via AVQueuePlayer; no audiobook bytes are kept on disk.
 """
 from __future__ import annotations
@@ -38,12 +38,11 @@ from .hls_book import BookPlanCache, book_ref, PLAY_TOTAL_BUDGET_SECONDS  # NEXT
 from .progress import progress_store
 from . import fixed_m4b  # NEXTORY_FIXED_M4B_V1
 from .discovery import (CATEGORIES, CatalogPreview, CatalogIndex, NextoryError as DiscoveryError,
-                        REFRESH_SECONDS, catalog_index)
+                        REFRESH_SECONDS, catalog_index, item_id_for)
 
 COMPAT_VERSION = '2.25.0'  # Native iOS uses public/session direct-play route since 2.22.
 USERNAME = os.getenv('TEST_USERNAME', 'test')
 PASSWORD = os.getenv('TEST_PASSWORD', '')
-BOOKS_FILE = Path(os.getenv('NEXTORY_BOOKS_FILE', '/run/nextory/book-ids.txt'))
 if len(PASSWORD) < 12:
     raise RuntimeError('Set TEST_PASSWORD to a local server password of at least 12 characters')
 
@@ -78,8 +77,6 @@ SECRET = load_auth_secret(progress_store.path.with_name('auth-secret'))
 LIBRARY_ID = str(uuid5(NAMESPACE_URL, 'nextory-abs-poc:library'))
 FOLDER_ID = str(uuid5(NAMESPACE_URL, 'nextory-abs-poc:folder'))
 USER_ID = str(uuid5(NAMESPACE_URL, 'nextory-abs-poc:user'))
-FIRST_NEXTORY_ID = 7207495
-FIRST_BOOK_ID = '572c4427-e49a-579d-b5bb-0b24729778bf'  # Keep v3 item ID stable.
 STARTED_MS = 1795170000000
 
 DISCOVERY_LIBS = {'new': str(uuid5(NAMESPACE_URL, 'nextory-abs-poc:library:new'))}
@@ -131,42 +128,11 @@ async def security_headers(request: Request, call_next):
     return response
 
 
-def configured_ids() -> tuple[int, ...]:
-    """Re-read the bind-mounted file on every call; no container restart needed."""
-    try:
-        lines = BOOKS_FILE.read_text('utf-8').splitlines()
-    except FileNotFoundError:
-        return (FIRST_NEXTORY_ID,)
-    except OSError as exc:
-        raise NextoryError('Nextory book list is unreadable') from exc
-    result = []
-    for line in lines:
-        text = line.split('#', 1)[0].strip()
-        if not text:
-            continue
-        if not text.isascii() or not text.isdigit() or not 5 <= len(text) <= 12:
-            raise NextoryError('Book list contains an invalid product ID')
-        number = int(text)
-        if number not in result:
-            result.append(number)
-        if len(result) > 25:
-            raise NextoryError('Maximum 25 configured Nextory books in this test')
-    return tuple(result)
-
-
-def item_id_for(book_id: int) -> str:
-    return FIRST_BOOK_ID if book_id == FIRST_NEXTORY_ID else str(
-        uuid5(NAMESPACE_URL, f'nextory-abs-poc:item:{book_id}'))
-
-
 def media_id_for(book_id: int) -> str:
     return str(uuid5(NAMESPACE_URL, f'nextory-abs-poc:media:{book_id}'))
 
 
 def id_to_book(item_id: str) -> int:
-    for number in configured_ids():
-        if item_id_for(number) == item_id:
-            return number
     number = catalog_index.resolve_item(item_id)
     if number is not None:
         return number
@@ -408,35 +374,7 @@ def summary_item(preview: CatalogPreview) -> dict:
             'mediaType': 'book', 'media': media, 'numFiles': 1, 'size': 0}
 
 
-def _pinned_previews():
-    """No extra external requests needed if a book already has a cached preview."""
-    products = []
-    for number in configured_ids():
-        if catalog_index.has(number):
-            continue
-        try:
-            if hasattr(nextory, 'get_product_preview'):
-                item = nextory.get_product_preview(number)
-            else:  # Offline protocol fixtures from v4.
-                info = nextory.get_book(number)
-                item = {'book_id': info.book_id, 'title': info.title,
-                        'authors': info.authors, 'narrators': info.narrators,
-                        'description': info.description, 'language': info.language,
-                        'cover_url': info.cover_url, 'publisher': info.publisher,
-                        'isbn': info.isbn, 'published_date': info.published_date,
-                        'series_name': info.series_name, 'series_order': info.series_order,
-                        'duration': None, 'subtitle': info.subtitle, 'genres': info.genres}
-            if item:
-                products.append(item)
-        except NextoryError as exc:
-            logging.warning('Previously pinned product %s unavailable: %s', number, exc)
-    if products:
-        catalog_index.upsert(products)
-
-
 def _library_list(shelf: str, page: int, limit: int):
-    if shelf == 'all':
-        _pinned_previews()
     if shelf.startswith('category:'):
         try:
             catalog_index.ensure_category(shelf.split(':', 1)[1], page, limit)
@@ -457,7 +395,9 @@ async def _discovery_poller():
             await run_in_threadpool(catalog_index.refresh_recent)
         except (NextoryError, OSError, ValueError) as exc:
             logging.warning('Nextory catalog refresh failed (preserving last index): %s', exc)
-        await asyncio.sleep(REFRESH_SECONDS)
+            await asyncio.sleep(60)
+        else:
+            await asyncio.sleep(REFRESH_SECONDS)
 
 
 @app.on_event('startup')
@@ -477,23 +417,6 @@ async def stop_discovery():
             pass
     prewarm_manager.shutdown()  # NEXTORY_DETAIL_PREWARM_V1
     book_plan_cache.shutdown()  # NEXTORY_SINGLE_PRESENTATION_V1
-
-
-def _collect_catalog() -> tuple[list[tuple[BookInfo, tuple[TrackPart, ...]]], dict[int, str]]:
-    results, errors = [], {}
-    for book_id in configured_ids():
-        try:
-            info = nextory.get_book(book_id)
-            tracks = nextory.get_layout(book_id)
-            results.append((info, tracks))
-        except NextoryError as exc:
-            errors[book_id] = str(exc)
-            logging.warning('Catalog item %s temporarily unavailable: %s', book_id, exc)
-    return results, errors
-
-
-async def catalog():
-    return await run_in_threadpool(_collect_catalog)
 
 
 def _compute_book_and_layout(book_id: int) -> tuple[BookInfo, tuple[TrackPart, ...], int, int]:
@@ -623,10 +546,6 @@ async def index():
 @app.get('/health')
 @app.get('/healthcheck')
 async def health():
-    try:
-        books = list(configured_ids())
-    except NextoryError:
-        books = []
     config_mounted = CONFIG_PATH.is_file()
     try:
         nextory._credentials()
@@ -635,8 +554,7 @@ async def health():
     else:
         audio_enabled = True
     return {'status': 'ok', 'audioEnabled': audio_enabled,
-            'mode': 'nextory-multiple-hls-tracks', 'configMounted': config_mounted,
-            'configuredBookIds': books}
+            'mode': 'nextory-multiple-hls-tracks', 'configMounted': config_mounted}
 
 
 @app.get('/ping')
@@ -773,10 +691,6 @@ async def personalized(library_id: str, _: bool = Depends(authenticated)):
     # The home screen must never wait for full audiobook layouts or category
     # website scans. All rows are satisfied by the existing metadata index.
     def from_index():
-        try:
-            _pinned_previews()
-        except NextoryError as exc:
-            logging.warning('Pinned Nextory previews unavailable: %s', exc)
         rows = []
         for shelf, label in [('new', 'Nieuw ontdekt'),
                              ('all', 'Alle ontdekte luisterboeken')]:
@@ -894,6 +808,7 @@ async def search(library_id: str, q: str = '', _: bool = Depends(authenticated))
 
 
 @app.get('/api/poc/discovery-status')
+@app.get('/api/poc/catalog-status')
 async def discovery_status(_: bool = Depends(authenticated)):
     return {'mode': 'dynamic-nextory-discovery',
             'visibleLibraries': 1, 'collections': len(COLLECTION_SHELVES),
@@ -910,16 +825,6 @@ async def discovery_refresh(_: bool = Depends(authenticated)):
         return await run_in_threadpool(catalog_index.refresh_recent)
     except NextoryError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-
-
-@app.get('/api/poc/catalog-status')
-async def catalog_status(_: bool = Depends(authenticated)):
-    books, errors = await catalog()
-    return {'configuredIds': configured_ids(),
-            'books': [{'id': info.book_id, 'title': info.title,
-                       'authors': info.authors, 'parts': len(tracks),
-                       'duration': round(tracks[-1].start + tracks[-1].duration, 3)}
-                      for info, tracks in books], 'errors': errors}
 
 
 @app.get('/api/items/{item_id}')
@@ -1370,9 +1275,3 @@ async def socket_io_v4(ws: WebSocket):
                 break
     except (WebSocketDisconnect, RuntimeError):
         pass
-
-
-# NEXTORY_FORMAT_CONTROL_V1
-import sys as _format_control_sys
-from . import format_control
-format_control.install(_format_control_sys.modules[__name__])

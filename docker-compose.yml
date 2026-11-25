@@ -8,13 +8,8 @@ services:
       NEXTORY_USERNAME: "${NEXTORY_USERNAME:?Set NEXTORY_USERNAME in .env}"
       NEXTORY_PASSWORD: "${NEXTORY_PASSWORD:?Set NEXTORY_PASSWORD in .env}"
       TEST_PASSWORD: "${TEST_PASSWORD:?Set TEST_PASSWORD in .env}"
-      NEXTORY_BOOKS_FILE: /run/nextory-book-ids.txt
       PROGRESS_FILE: /state/progress.json
     volumes:
-      - type: bind
-        source: ./book-ids.txt
-        target: /run/nextory-book-ids.txt
-        read_only: true
       - type: volume
         source: nextory-progress
         target: /state

@@ -56,6 +56,13 @@ CATEGORY_PATHS = {code: path for code, _, path in CATEGORIES}
 BOOK_HREF = re.compile(r'^/nl/book/[a-zA-Z0-9%\-]+-(\d{5,12})/?$')
 
 
+def item_id_for(book_id: int) -> str:
+    # Preserve the legacy client ID when this title is discovered normally.
+    if book_id == 7207495:
+        return '572c4427-e49a-579d-b5bb-0b24729778bf'
+    return str(uuid5(NAMESPACE_URL, f'nextory-abs-poc:item:{book_id}'))
+
+
 class Links(HTMLParser):
     """Extract public /nl/book/...-123 IDs from actual <a href> links."""
     def __init__(self):
@@ -186,8 +193,7 @@ class CatalogIndex:
                 con.execute('''INSERT INTO books(id, item_id, metadata, first_seen, last_seen)
                                VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
                                metadata=excluded.metadata, last_seen=excluded.last_seen''',
-                            (book_id, ('572c4427-e49a-579d-b5bb-0b24729778bf' if book_id == 7207495
-                                       else str(uuid5(NAMESPACE_URL, f'nextory-abs-poc:item:{book_id}'))),
+                            (book_id, item_id_for(book_id),
                              json.dumps(preview.as_dict(), ensure_ascii=False), now, now))
                 if shelf:
                     con.execute('''INSERT INTO shelves(shelf,page,position,book_id)
@@ -211,9 +217,6 @@ class CatalogIndex:
         with self._lock, self._connect() as con:
             row = con.execute('SELECT metadata FROM books WHERE id=?', (book_id,)).fetchone()
         return CatalogPreview.from_dict(json.loads(row['metadata'])) if row else None
-
-    def has(self, book_id: int) -> bool:
-        return self.lookup(book_id) is not None
 
     def resolve_item(self, item_id: str) -> int | None:
         with self._lock, self._connect() as con:
@@ -243,7 +246,7 @@ class CatalogIndex:
         return [CatalogPreview.from_dict(json.loads(r['metadata'])) for r in rows], count
 
     def select_all_offset(self, offset: int, limit: int, exclude_ids: tuple[int, ...] = ()):
-        """Efficient cursor slice; pinned books stay at the front of v4 library."""
+        """Return a cursor slice over indexed titles."""
         if not 0 <= offset <= 1000000 or not 0 <= limit <= 1000:
             raise ValueError('Invalid catalog slice')
         with self._lock, self._connect() as con:
@@ -328,28 +331,24 @@ class CatalogIndex:
                 candidates.extend(parse_book_ids(self._fetch_public(url)))
             except (NextoryError, requests.RequestException) as exc:
                 failures.append(type(exc).__name__)
-        # If Nextory blocks website requests, try their verified discovery search API.
-        if not candidates:
-            try:
-                previews = nextory.search_catalog('', page=0, per=30)
-                if previews:
-                    self.upsert(previews, 'recent', 0, replace=True)
-                    return {'status': 'ok', 'source': 'nextory-search', **self.statistics()}
-            except NextoryError as exc:
-                failures.append(type(exc).__name__)
-        if not candidates:
-            self._set_error('Recent catalogue feed unavailable (' + ','.join(failures) + ')')
-            raise NextoryError('Nextory public discovery feeds unavailable')
         ids = list(dict.fromkeys(candidates))[:70]
         products = self._hydrate(ids, max_new=55)
-        if products:
-            self.upsert(products, 'recent', 0, replace=True)
-            with self._lock, self._connect() as con:
-                con.execute("DELETE FROM stats WHERE key='error'")
-        else:
-            self._set_error('Recent page returned no accessible audiobook products')
-            raise NextoryError('No playable audiobooks in recent public catalogue feed')
-        return {'status': 'ok', 'source': 'public-pages', **self.statistics()}
+        source = 'public-pages'
+        # Public links can be missing or point only to unavailable titles.
+        if not products:
+            try:
+                products = nextory.search_catalog('', page=0, per=30)
+                source = 'nextory-search'
+            except NextoryError as exc:
+                failures.append(type(exc).__name__)
+        if not products:
+            message = 'Nextory discovery returned no accessible audiobooks'
+            self._set_error(message + (': ' + ', '.join(failures) if failures else ''))
+            raise NextoryError(message)
+        self.upsert(products, 'recent', 0, replace=True)
+        with self._lock, self._connect() as con:
+            con.execute("DELETE FROM stats WHERE key='error'")
+        return {'status': 'ok', 'source': source, **self.statistics()}
 
     def ensure_category(self, key: str, requested_page: int, limit: int = 20):
         if key not in CATEGORY_PATHS:

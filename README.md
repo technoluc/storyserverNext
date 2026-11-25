@@ -20,6 +20,10 @@ De voorbeeldconfiguratie maakt de server bereikbaar op je lokale netwerk. Gebrui
 
 Met `docker compose ps` zie je of de server gezond is. Met `docker compose logs --tail=100 nextory-abs-poc` lees je de recente meldingen. Doe na wijzigingen aan de broncode `docker compose up -d --build`.
 
+## Catalogus
+
+De server haalt bij het starten automatisch luisterboekmetadata op bij Nextory en bewaart die in het Docker-volume. De bibliotheek kan bij een eerste start kort leeg zijn. Zoeken gebruikt Nextory live, en als je een genrecollectie opent kan de server meer titels aan de lokale index toevoegen. De bibliotheek groeit mee met die zoek- en ontdekacties. Je hoeft geen boek-ID’s in te vullen.
+
 ## Bestaande installatie bijwerken
 
 Voeg de twee Nextory-variabelen toe aan je bestaande `.env` en behoud je huidige serverwachtwoord. Als `TEST_AUTH_SECRET` al ingesteld is, laat die waarde dan staan om bestaande aanmeldsessies te behouden. Bij een nieuwe installatie maakt de server zelf een sessiesleutel in het Docker-volume, dat ook je luistervoortgang bewaart. Gebruik bij een upgrade dezelfde Compose-projectnaam om dat volume te blijven gebruiken.
