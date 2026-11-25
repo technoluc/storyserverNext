@@ -129,6 +129,10 @@ class NextoryBackend:
         self._manifest_cache = OrderedDict()
         self._manifest_cache_bytes = 0
 
+    @property
+    def access_paused(self) -> bool:
+        return self._access_blocked
+
     def _credentials(self) -> tuple[str, str]:
         username = os.environ.get('NEXTORY_USERNAME')
         password = os.environ.get('NEXTORY_PASSWORD')
@@ -632,6 +636,9 @@ class NextoryBackend:
                 response = self._api.get(
                     f'https://api.nextory.com/discovery/v1/product/{book_id}',
                     timeout=(8, 18), allow_redirects=False)
+                if response.status_code in (404, 410):
+                    response.close()
+                    return None
                 data = self._checked_json(response, 'product preview')
             except requests.RequestException as exc:
                 raise NextoryError('Network error fetching product preview') from exc
