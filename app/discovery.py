@@ -452,8 +452,11 @@ class CatalogIndex:
             if repeated:
                 pause('repeated-source-page')
                 return last_saved
+            if len(set(ids)) > 100:
+                pause('source-page-candidate-limit')
+                return last_saved
             before = self.select(shelf, 0, 1)[1]
-            products = self._hydrate(ids, max_new=len(set(ids)))
+            products = self._hydrate(ids, max_new=100)
             self.upsert(products, shelf, source_page, replace=True)
             count = self.select(shelf, 0, 1)[1]
             stall = (int(row[0]) if row else 0) + 1 if count <= before else 0
