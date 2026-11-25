@@ -396,6 +396,8 @@ async def dynamic_listing(shelf: str, page: int = 0, limit: int = 20):
 
 
 def _collection_listing(shelf: str, page: int, limit: int | None):
+    if os.getenv('CATALOG_AUTOSYNC', '1') == '1':
+        return catalog_index.select(shelf, page, limit) if limit is not None else catalog_index.select(shelf, 0, -1)
     if limit is not None:
         return _library_list(shelf, page, limit)
     if shelf.startswith('category:'):
@@ -419,21 +421,39 @@ async def _discovery_poller():
             await asyncio.sleep(REFRESH_SECONDS)
 
 
+async def _collection_poller():
+    logger = logging.getLogger('uvicorn.error')
+    while True:
+        filled = False
+        for key, _, _ in CATEGORIES:
+            try:
+                result = await run_in_threadpool(catalog_index.fill_next_category_page, key)
+            except (NextoryError, OSError, ValueError, sqlite3.Error) as exc:
+                logger.warning('Dutch collection sync failed category=%s error=%s', key, type(exc).__name__)
+                await asyncio.sleep(15)
+                continue
+            if result is not None:
+                filled = True
+                logger.info('POC_CATALOG category=%s source_page=%d indexed=%d', key, *result)
+                await asyncio.sleep(15)
+        if not filled:
+            await asyncio.sleep(60)
+
+
 @app.on_event('startup')
 async def start_discovery():
     if os.getenv('CATALOG_AUTOSYNC', '1') == '1':
         app.state.catalog_task = asyncio.create_task(_discovery_poller())
+        app.state.collection_task = asyncio.create_task(_collection_poller())
 
 
 @app.on_event('shutdown')
 async def stop_discovery():
-    task = getattr(app.state, 'catalog_task', None)
-    if task:
+    tasks = [task for name in ('catalog_task', 'collection_task')
+             if (task := getattr(app.state, name, None)) is not None]
+    for task in tasks:
         task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+    await asyncio.gather(*tasks, return_exceptions=True)
     prewarm_manager.shutdown()  # NEXTORY_DETAIL_PREWARM_V1
     book_plan_cache.shutdown()  # NEXTORY_SINGLE_PRESENTATION_V1
 
@@ -874,6 +894,7 @@ async def discovery_status(_: bool = Depends(authenticated)):
             'search': 'nextory-discovery-api',
             'categories': [code for code, _, _ in CATEGORIES],
             'automaticRefresh': os.getenv('CATALOG_AUTOSYNC', '1') == '1',
+            'automaticCollectionFill': os.getenv('CATALOG_AUTOSYNC', '1') == '1',
             **(await run_in_threadpool(catalog_index.statistics))}
 
 

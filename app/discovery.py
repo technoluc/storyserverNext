@@ -15,6 +15,7 @@ import re
 import sqlite3
 import threading
 import time
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
@@ -161,12 +162,13 @@ class CatalogIndex:
                                   'Accept': 'text/html'})
         self._connect_and_init()
 
+    @contextmanager
     def _connect(self):
-        con = sqlite3.connect(str(self.path), timeout=10)
-        con.row_factory = sqlite3.Row
-        con.create_function('is_dutch', 1, is_dutch, deterministic=True)
-        con.execute('PRAGMA busy_timeout=10000')
-        return con
+        with closing(sqlite3.connect(str(self.path), timeout=10)) as con, con:
+            con.row_factory = sqlite3.Row
+            con.create_function('is_dutch', 1, is_dutch, deterministic=True)
+            con.execute('PRAGMA busy_timeout=10000')
+            yield con
 
     def _connect_and_init(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -376,14 +378,28 @@ class CatalogIndex:
         with self._category_locks[key]:
             self._scan_category(key, (requested_page+1)*limit)
 
-    def _scan_category(self, key: str, target: int):
+    def fill_next_category_page(self, key: str) -> tuple[int, int] | None:
+        """Fill one source page per turn so all genres can make progress."""
+        lock = self._category_locks[key]
+        if not lock.acquire(blocking=False):
+            return None
+        try:
+            return self._scan_category(key, target=None, page_budget=1)
+        finally:
+            lock.release()
+
+    def _scan_category(self, key: str, target: int | None,
+                       page_budget: int = SOURCE_PAGES_PER_REQUEST) -> tuple[int, int] | None:
         shelf = 'category:' + key
-        if not self.category_has_more(shelf) or self.select(shelf, 0, 1)[1] >= target:
-            return
+        if not self.category_has_more(shelf):
+            return None
+        if target is not None and self.select(shelf, 0, 1)[1] >= target:
+            return None
         with self._lock, self._connect() as db:
             first = db.execute('SELECT COALESCE(MAX(page), 0) + 1 FROM scans WHERE shelf=?',
                                (shelf,)).fetchone()[0]
-        for source_page in range(first, min(first + SOURCE_PAGES_PER_REQUEST, 10001)):
+        last_saved = None
+        for source_page in range(first, min(first + page_budget, 10001)):
             uri = 'https://nextory.com' + CATEGORY_PATHS[key]
             if source_page > 1:
                 uri += '?page=' + str(source_page)
@@ -399,11 +415,14 @@ class CatalogIndex:
                 with self._lock, self._connect() as con:
                     con.execute('INSERT OR REPLACE INTO stats(key,value) VALUES(?,?)',
                                 ('end:' + shelf, str(source_page)))
-                return
+                return last_saved
             products = self._hydrate(ids, max_new=100)
             self.upsert(products, shelf, source_page, replace=True)
-            if self.select(shelf, 0, 1)[1] >= target:
+            count = self.select(shelf, 0, 1)[1]
+            last_saved = (source_page, count)
+            if target is not None and count >= target:
                 break
+        return last_saved
 
 
 def search_dutch_catalog(query: str, limit: int = 30) -> list[dict]:
